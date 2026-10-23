@@ -1,4 +1,5 @@
 import { CellValue } from './Formats';
+import { oaDateToTime } from './writerHelpers';
 
 /**
  * Shared reader surface for XLSB and XLSX.
@@ -35,13 +36,26 @@ export abstract class ExcelReaderAbstract {
     /** Cell value for column index `i` of the current row (0-based). */
     abstract getValue(i: number): CellValue;
 
+    /**
+     * Select a worksheet for subsequent `read()` calls (by name or 0-based index).
+     * Resets row state/EOF; default is sheet 0. Resets `fieldCount`.
+     */
+    abstract selectSheet(nameOrIndex: string | number): Promise<void>;
+
+    /**
+     * Advance to the next worksheet (like `nextResult` in DB readers).
+     * @returns true if another sheet was selected; false at end.
+     */
+    abstract nextResult(): Promise<boolean>;
+
     dispose(): void {
         // cleanup
     }
 
     getDateTimeFromOaDate(oaDate: number): Date {
-        const ms = oaDate * 86400000 + this._oaEpoch;
-        return new Date(ms);
+        // Round to the nearest millisecond: the float product can land just below a whole ms (x.999),
+        // and Date truncates instead of rounding. Handles the fictitious 1900-02-29.
+        return new Date(oaDateToTime(oaDate, this._oaEpoch));
     }
 }
 

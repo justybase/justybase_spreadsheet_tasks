@@ -161,11 +161,38 @@ console.log(sheets); // ['Sheet1', 'Sheet2']
 Reads the next row. Returns `true` if a row was read, `false` if end of sheet reached.
 Always use `await` (both XLSB and XLSX are async in v2+).
 
+Empty rows: gaps in the sheet (missing `<row>` / `BrtRowHdr`, including leading
+gaps) are returned as empty rows (`[]`, `getValue()` → `null`). Like xlspy,
+gap positions are yielded; unlike xlspy's padded `[None] * cols`, this reader
+yields a zero-length row so callers must not assume `fieldCount` width.
+The 1904 date system (`workbookPr date1904` / `BrtWbProp`) is honoured.
+
 **Example:**
 ```typescript
 while (await reader.read()) {
     // Process row
 }
+```
+
+#### `selectSheet(nameOrIndex: string | number): Promise<void>`
+
+Selects a worksheet for subsequent `read()` calls. Resets row/EOF and `fieldCount`.
+Default is sheet 0.
+
+```typescript
+await reader.selectSheet('Second');
+await reader.selectSheet(0);
+```
+
+#### `nextResult(): Promise<boolean>`
+
+Advances to the next worksheet. Returns `true` if another sheet was selected,
+`false` at the end.
+
+```typescript
+do {
+  while (await reader.read()) { /* rows */ }
+} while (await reader.nextResult());
 ```
 
 #### `getValue(columnIndex: number): CellValue`
@@ -221,6 +248,16 @@ Returns array of worksheet names.
 #### `read(): Promise<boolean>`
 
 Reads the next row. Returns `true` if a row was read. Always use `await`.
+Empty gap rows (including leading) are returned as empty rows; see
+[XlsbReader](#xlsbreader) for `selectSheet`/`nextResult`, which behave identically.
+
+#### `selectSheet(nameOrIndex: string | number): Promise<void>`
+
+See [XlsbReader](#xlsbreader).
+
+#### `nextResult(): Promise<boolean>`
+
+See [XlsbReader](#xlsbreader).
 
 #### `getValue(columnIndex: number): CellValue`
 
@@ -288,6 +325,12 @@ Clears the entire cell data of the target sheet and writes new rows in its place
 - Pivot tables whose `worksheetSource` references the updated sheet get their
   `ref` and `recordCount` adjusted, and `refreshOnLoad="1"` is added to the
   pivot table definitions so Excel refreshes them on open.
+- The stale calculation chain (`xl/calcChain.xml`) is removed with its
+  `Content_Types`/rels entries; Excel rebuilds it on open.
+- ListObject tables (`xl/tables/*.xml`) anchored at `A1` get their `<table>`
+  and `<autoFilter>` `ref` updated to the new dimension. Tables whose column
+  count changes are left untouched (their `tableColumns` would need rebuilding),
+  and ranges are capped so they never overlap another table.
 
 **Example:**
 ```typescript
@@ -384,6 +427,10 @@ Clears the entire cell data of the target sheet and writes new rows in its place
 - Pivot caches whose `worksheetSource` references the updated sheet get their
   range and record count adjusted, and the `refreshOnLoad` flag is set so Excel
   refreshes them on open.
+- The stale calculation chain (`xl/calcChain.bin`) is removed with its
+  `Content_Types`/rels entries.
+- XLSB ListObject tables are **not** patched (documented limitation); only the
+  sheet dimension (`BrtWsDim`) and pivot caches are updated.
 
 **Example:**
 ```typescript
@@ -477,6 +524,18 @@ await reader.open('data.xlsb');
 ---
 
 ## Types
+
+### Excel limits (throw, xlspy parity)
+
+```typescript
+import { MAX_ROWS, MAX_COLS, MAX_CELL_CHARS } from '@justybase/spreadsheet-tasks';
+// MAX_ROWS = 1_048_576, MAX_COLS = 16_384, MAX_CELL_CHARS = 32_767 UTF-16 units
+```
+
+Writers throw when a limit is exceeded (no truncation, workbook not published).
+`writeSheet` also throws when a row/header is longer than `columnCount`, matching
+streaming `writeRow` behaviour. Astral characters count as 2 units
+(`'😀'.length === 2`).
 
 ### Supported Cell Types
 

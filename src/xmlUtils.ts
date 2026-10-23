@@ -42,16 +42,59 @@ export function escapeXmlText(str: string): string {
     return out;
 }
 
-/** Unescape the five predefined XML entities. */
+/** Unescape the five predefined XML entities (single-pass, order-independent). */
 export function unescapeXml(str: string): string {
     if (!str || str.indexOf('&') === -1) return str;
-    return str.replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-        .replace(/&#(\d+);/g, (_match, decimal: string) => String.fromCodePoint(parseInt(decimal, 10)))
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'");
+    return str.replace(/&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g, (entity: string) => {
+        switch (entity) {
+            case '&amp;': return '&';
+            case '&lt;': return '<';
+            case '&gt;': return '>';
+            case '&quot;': return '"';
+            case '&apos;': return "'";
+            default: {
+                // Numeric character reference: &#123; or &#x1F600;
+                if (entity[1] === '#') {
+                    const body = entity.slice(2, -1);
+                    const code = body[0] === 'x' || body[0] === 'X'
+                        ? parseInt(body.slice(1), 16)
+                        : parseInt(body, 10);
+                    if (Number.isFinite(code)) {
+                        try { return String.fromCodePoint(code); } catch { return entity; }
+                    }
+                }
+                return entity;
+            }
+        }
+    });
+}
+
+/** Parse XML tag attributes into a map, independent of order/prefix/quote style. */
+export function parseTagAttributes(tag: string): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    // Matches name="value" or name='value', allowing : and . in names (r:id, xml:space).
+    const re = /([A-Za-z_][\w.:-]*)\s*=\s*("([^"]*)"|'([^']*)')/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(tag)) !== null) {
+        const name = m[1];
+        const value = m[3] !== undefined ? m[3] : m[4];
+        attrs[name] = value;
+        // Also store local name without prefix for convenience (r:id -> id).
+        const colon = name.indexOf(':');
+        if (colon !== -1) {
+            const local = name.slice(colon + 1);
+            if (!(local in attrs)) attrs[local] = value;
+        }
+    }
+    return attrs;
+}
+
+/** Resolve a workbook rel Target to a zip entry path (xlspy _resolve_path logic). */
+export function resolveRelTarget(target: string): string {
+    if (!target) return target;
+    if (target.startsWith('/')) return target.slice(1);
+    if (target.startsWith('xl/')) return target;
+    return 'xl/' + target;
 }
 
 /** 0-based column index -> "A", "B", ..., "AA", "AB", ... (bijective base-26). */
@@ -92,13 +135,25 @@ export function trimTrailingEmptyRows<T>(rows: T[][]): T[][] {
 /**
  * Parse the contents of xl/sharedStrings.xml into the list of string values.
  * Handles plain `<si><t>…</t></si>` entries as well as rich-text `<si><r><t>…</t></r></si>` runs.
+ * Phonetic `<rPh>` blocks are skipped (xlspy parity) and self-closing `<si/>` yields "".
  */
 export function parseSharedStringsXml(xml: string): string[] {
     const result: string[] = [];
-    const itemRegex = /<(?:(?:[A-Za-z_][\w.-]*):)?si\b[^>]*>([\s\S]*?)<\/(?:(?:[A-Za-z_][\w.-]*):)?si\s*>/gi;
+    // Self-closing <si/> entries (empty strings) — count them to keep indices aligned.
+    // Full <si>…</si> entries handled below.
+    const itemRegex = /<(?:(?:[A-Za-z_][\w.-]*):)?si\b[^>]*>([\s\S]*?)<\/(?:(?:[A-Za-z_][\w.-]*):)?si\s*>|<(?:(?:[A-Za-z_][\w.-]*):)?si\b[^>]*\/>/gi;
     let itemMatch: RegExpExecArray | null;
     while ((itemMatch = itemRegex.exec(xml)) !== null) {
-        const content = itemMatch[1];
+        const full = itemMatch[0];
+        if (full.endsWith('/>') && itemMatch[1] === undefined) {
+            result.push('');
+            continue;
+        }
+        let content = itemMatch[1] ?? '';
+        // Skip phonetic runs entirely (their <t> is a reading hint, not cell text).
+        content = content.replace(/<(?:(?:[A-Za-z_][\w.-]*):)?rPh\b[^>]*>[\s\S]*?<\/(?:(?:[A-Za-z_][\w.-]*):)?rPh\s*>/gi, '');
+        // Handle self-closing rPh as well.
+        content = content.replace(/<(?:(?:[A-Za-z_][\w.-]*):)?rPh\b[^>]*\/>/gi, '');
         const textRegex = /<(?:(?:[A-Za-z_][\w.-]*):)?t\b[^>]*>([\s\S]*?)<\/(?:(?:[A-Za-z_][\w.-]*):)?t\s*>/gi;
         let value = '';
         let textMatch: RegExpExecArray | null;

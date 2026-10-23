@@ -1,13 +1,28 @@
 import yauzl, { ZipFile, Entry } from 'yauzl';
 import { ExcelReaderAbstract } from './ExcelReaderAbstract';
 import { CellValue } from './Formats';
-import { unescapeXml, columnLetterToIndex, parseSharedStringsXml } from './xmlUtils';
+import { unescapeXml, columnLetterToIndex, parseSharedStringsXml, parseTagAttributes, resolveRelTarget } from './xmlUtils';
+import { MAX_ROWS } from './writerHelpers';
 
 interface SheetInfo {
     name: string;
     sheetId: string;
     rId: string;
     path: string;
+}
+
+/**
+ * Parse an ISO 8601 `t="d"` cell as UTC. Numeric OA dates are converted from a
+ * UTC epoch, so a value without an offset must not be interpreted as local time.
+ */
+function parseIsoDateUtc(value: string): Date | null {
+    let text = value.trim().replace(' ', 'T');
+    if (!text) return null;
+    if (!/z$|[+-]\d{2}:?\d{2}$/i.test(text) && text.includes('T')) {
+        text += 'Z';
+    }
+    const date = new Date(text);
+    return Number.isNaN(date.getTime()) ? null : date;
 }
 
 export class XlsxReader extends ExcelReaderAbstract {
@@ -20,8 +35,12 @@ export class XlsxReader extends ExcelReaderAbstract {
     private _currentSheetIndex: number = -1;
     private _sheetXml: string | null = null;
     private _xmlPos: number = 0;
+    /** End of the sheetData element; row tags must not be searched past it. */
+    private _xmlEnd: number = 0;
 
     private _currentRow: CellValue[] = [];
+    private _expectedRowNum: number = 1;
+    private _pendingEmptyCount: number = 0;
 
     xfIdToNumFmtId: number[] = [];
     customDateFormats: Set<number> = new Set();
@@ -31,6 +50,24 @@ export class XlsxReader extends ExcelReaderAbstract {
     }
 
     async open(path: string, readSharedStrings: boolean = true): Promise<void> {
+        await this.close();
+        // Reset state so re-opening does not accumulate sheets (xlspy parity).
+        this.sheetNames = [];
+        this.sheets = [];
+        this.sharedStrings = [];
+        this.xfIdToNumFmtId = [];
+        this.customDateFormats = new Set();
+        this.fieldCount = 0;
+        this.resultsCount = 0;
+        this.actualSheetName = '';
+        this._currentSheetIndex = -1;
+        this._sheetXml = null;
+        this._xmlPos = 0;
+        this._xmlEnd = 0;
+        this._currentRow = [];
+        this._expectedRowNum = 1;
+        this._pendingEmptyCount = 0;
+        this._oaEpoch = Date.UTC(1899, 11, 30);
         return new Promise((resolve, reject) => {
             yauzl.open(path, { lazyEntries: true, autoClose: false }, async (err, zipfile) => {
                 if (err) return reject(err);
@@ -48,30 +85,43 @@ export class XlsxReader extends ExcelReaderAbstract {
                         const wbRelsContent = await this._readZipEntryContent('xl/_rels/workbook.xml.rels');
                         const rIdToTarget: Record<string, string> = {};
                         if (wbRelsContent) {
-                            const relRegex = /<Relationship[^>]*Id="([^"]*)"[^>]*Target="([^"]*)"/g;
-                            let match;
-                            while ((match = relRegex.exec(wbRelsContent)) !== null) {
-                                rIdToTarget[match[1]] = match[2];
+                            const relTagRe = /<Relationship\b[^>]*>/g;
+                            let tagMatch;
+                            while ((tagMatch = relTagRe.exec(wbRelsContent)) !== null) {
+                                const attrs = parseTagAttributes(tagMatch[0]);
+                                const id = attrs['Id'] ?? attrs['id'];
+                                const target = attrs['Target'] ?? attrs['target'];
+                                if (id !== undefined && target !== undefined) {
+                                    rIdToTarget[id] = target;
+                                }
                             }
                         }
 
                         const wbContent = await this._readZipEntryContent('xl/workbook.xml');
                         if (wbContent) {
-                            const sheetRegex = /<sheet[^>]*name="([^"]*)"[^>]*sheetId="([^"]*)"[^>]*r:id="([^"]*)"/g;
-                            let match;
-                            while ((match = sheetRegex.exec(wbContent)) !== null) {
-                                const name = unescapeXml(match[1]);
-                                const sheetId = match[2];
-                                const rId = match[3];
-
+                            // Order-independent: parse each <sheet> tag then its attributes.
+                            const sheetTagRe = /<sheet\b[^>]*>/g;
+                            let tagMatch;
+                            while ((tagMatch = sheetTagRe.exec(wbContent)) !== null) {
+                                const attrs = parseTagAttributes(tagMatch[0]);
+                                const rawName = attrs['name'];
+                                const sheetId = attrs['sheetId'] ?? '';
+                                const rId = attrs['r:id'] ?? attrs['id'] ?? attrs['rId'];
+                                if (rawName === undefined || rId === undefined) continue;
+                                const name = unescapeXml(rawName);
                                 const target = rIdToTarget[rId];
-                                let fullPath = target;
-                                if (!fullPath.startsWith('xl/')) {
-                                    fullPath = 'xl/' + fullPath;
-                                }
+                                if (!target) continue;
+                                const fullPath = resolveRelTarget(target);
 
                                 this.sheetNames.push(name);
                                 this.sheets.push({ name, sheetId, rId, path: fullPath });
+                            }
+                            // 1904 date system (workbookPr date1904="1").
+                            const wbPrMatch = /<workbookPr\b[^>]*>/i.exec(wbContent);
+                            if (wbPrMatch) {
+                                const wbPrAttrs = parseTagAttributes(wbPrMatch[0]);
+                                const v = (wbPrAttrs['date1904'] ?? '').trim().toLowerCase();
+                                this._oaEpoch = (v === '1' || v === 'true') ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
                             }
                         }
 
@@ -173,6 +223,29 @@ export class XlsxReader extends ExcelReaderAbstract {
         }
     }
 
+    async selectSheet(nameOrIndex: string | number): Promise<void> {
+        let index = -1;
+        if (typeof nameOrIndex === 'number') {
+            index = nameOrIndex;
+        } else {
+            index = this.sheetNames.indexOf(nameOrIndex);
+            if (index === -1) throw new Error(`Sheet '${nameOrIndex}' not found`);
+        }
+        if (index < 0 || index >= this.sheets.length) {
+            throw new Error(`Sheet index ${String(nameOrIndex)} out of range`);
+        }
+        this._currentSheetIndex = index;
+        await this._initSheet(index);
+    }
+
+    async nextResult(): Promise<boolean> {
+        const next = this._currentSheetIndex + 1;
+        if (next >= this.sheets.length) return false;
+        this._currentSheetIndex = next;
+        await this._initSheet(next);
+        return true;
+    }
+
     private async _initSheet(index: number): Promise<void> {
         if (index >= this.sheets.length) return;
         const sheet = this.sheets[index];
@@ -185,22 +258,119 @@ export class XlsxReader extends ExcelReaderAbstract {
         }
 
         this._xmlPos = 0;
+        this._xmlEnd = this._sheetXml.length;
+        this._expectedRowNum = 1;
+        this._pendingEmptyCount = 0;
+        this._currentRow = [];
+        this.fieldCount = 0;
         const sd = this._sheetXml.indexOf('<sheetData>');
-        if (sd !== -1) this._xmlPos = sd + 11;
+        if (sd !== -1) {
+            this._xmlPos = sd + 11;
+            const se = this._sheetXml.indexOf('</sheetData>', this._xmlPos);
+            if (se !== -1) this._xmlEnd = se;
+        } else {
+            // Namespaced or self-closed sheetData.
+            const m = /<(?:[A-Za-z_][\w.-]*:)?sheetData\b[^>]*>/i.exec(this._sheetXml);
+            if (m && m.index !== undefined) {
+                this._xmlPos = m.index + m[0].length;
+                if (/\/>\s*$/.test(m[0])) {
+                    // <sheetData/> has no rows; do not scan the rest of the part.
+                    this._xmlEnd = this._xmlPos;
+                } else {
+                    const se = this._sheetXml.indexOf('</sheetData>', this._xmlPos);
+                    if (se !== -1) this._xmlEnd = se;
+                }
+            }
+        }
     }
 
     private _readNextRow(): boolean {
         if (!this._sheetXml) return false;
 
-        const rowStart = this._sheetXml.indexOf('<row', this._xmlPos);
+        // Emit queued gap rows first (leading + intermediate). They are empty.
+        if (this._pendingEmptyCount > 0) {
+            this._pendingEmptyCount--;
+            this._currentRow = [];
+            this._expectedRowNum++;
+            return true;
+        }
+
+        const rowStart = this._findRowTagStart(this._xmlPos);
         if (rowStart === -1) return false;
+
+        const rowTagEnd = this._sheetXml.indexOf('>', rowStart);
+        if (rowTagEnd === -1) return false;
+        const rowTag = this._sheetXml.substring(rowStart, rowTagEnd + 1);
+        const isSelfClosing = this._sheetXml.charCodeAt(rowTagEnd - 1) === 47; // '/>'
+        const rowAttrs = parseTagAttributes(rowTag);
+        const rRaw = rowAttrs['r'];
+        let rowNum = this._expectedRowNum;
+        if (rRaw !== undefined) {
+            const parsed = parseInt(rRaw, 10);
+            // Values beyond Excel's row limit are malformed; ignore them rather than
+            // expanding the gap into millions of phantom rows.
+            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= MAX_ROWS) rowNum = parsed;
+        }
+
+        // Gap: rows without <row> elements are returned as empty rows (xlspy parity).
+        if (rowNum > this._expectedRowNum) {
+            const gap = rowNum - this._expectedRowNum;
+            // Return one empty now, queue the rest without consuming the row.
+            this._pendingEmptyCount = gap - 1;
+            this._currentRow = [];
+            this._expectedRowNum++;
+            return true;
+        }
+        if (rowNum < this._expectedRowNum) {
+            // Out-of-order or duplicate: consume and resync forward.
+            if (isSelfClosing) {
+                this._xmlPos = rowTagEnd + 1;
+                this._currentRow = [];
+                return true;
+            }
+            const rowEnd = this._sheetXml.indexOf('</row>', rowStart);
+            if (rowEnd === -1) return false;
+            this._xmlPos = rowEnd + 6;
+            this._parseRowByIndex(rowStart, rowEnd);
+            this._expectedRowNum = Math.max(this._expectedRowNum + 1, rowNum + 1);
+            return true;
+        }
+
+        if (isSelfClosing) {
+            this._xmlPos = rowTagEnd + 1;
+            this._currentRow = [];
+            this._expectedRowNum = rowNum + 1;
+            return true;
+        }
 
         const rowEnd = this._sheetXml.indexOf('</row>', rowStart);
         if (rowEnd === -1) return false;
 
         this._xmlPos = rowEnd + 6;
         this._parseRowByIndex(rowStart, rowEnd);
+        this._expectedRowNum = rowNum + 1;
         return true;
+    }
+
+    /**
+     * Find the next `<row …>` start, ignoring similarly named elements such as
+     * `<rowBreaks>` that follow `</sheetData>`.
+     */
+    private _findRowTagStart(from: number): number {
+        const xml = this._sheetXml!;
+        let pos = from;
+        while (pos < this._xmlEnd) {
+            const idx = xml.indexOf('<row', pos);
+            if (idx === -1 || idx >= this._xmlEnd) return -1;
+            const next = xml.charCodeAt(idx + 4);
+            // Whitespace, '/' or '>' means this is the row element, not e.g. <rowBreaks>.
+            if (next === 0x3e || next === 0x2f || next === 0x20 ||
+                next === 0x09 || next === 0x0a || next === 0x0d) {
+                return idx;
+            }
+            pos = idx + 4;
+        }
+        return -1;
     }
 
     private _parseRowByIndex(rowStart: number, rowEnd: number): void {
@@ -208,6 +378,7 @@ export class XlsxReader extends ExcelReaderAbstract {
         const xml = this._sheetXml!;
 
         let pos = xml.indexOf('>', rowStart) + 1;
+        let nextCol = 0;
 
         while (pos < rowEnd) {
             const cStart = xml.indexOf('<c', pos);
@@ -250,6 +421,7 @@ export class XlsxReader extends ExcelReaderAbstract {
             }
 
             let val: string | null = null;
+            let inlineVals: string[] | null = null;
             if (xml.charCodeAt(nextTagClose - 1) === 47) {
                 pos = nextTagClose + 1;
             } else {
@@ -265,21 +437,30 @@ export class XlsxReader extends ExcelReaderAbstract {
                     }
                 } else {
                     if (type === 'inlineStr') {
-                        const tStart = xml.indexOf('<t', nextTagClose);
-                        if (tStart !== -1 && tStart < cellContentEnd) {
-                            const tContentStart = xml.indexOf('>', tStart) + 1;
+                        // Rich-text inlineStr: concatenate every <t> inside <is> (xlspy parity).
+                        inlineVals = [];
+                        let tSearch = nextTagClose;
+                        while (true) {
+                            const tStart = xml.indexOf('<t', tSearch);
+                            if (tStart === -1 || tStart >= cellContentEnd) break;
+                            const tClose = xml.indexOf('>', tStart);
+                            if (tClose === -1 || tClose >= cellContentEnd) break;
+                            const tContentStart = tClose + 1;
                             const tEnd = xml.indexOf('</t>', tContentStart);
-                            if (tEnd !== -1 && tEnd < cellContentEnd) {
-                                val = xml.substring(tContentStart, tEnd);
-                            }
+                            if (tEnd === -1 || tEnd > cellContentEnd) break;
+                            inlineVals.push(xml.substring(tContentStart, tEnd));
+                            tSearch = tEnd + 4;
                         }
+                        if (inlineVals.length === 0) inlineVals = null;
                     }
                 }
                 pos = cellContentEnd + 4;
             }
 
             let finalVal: any = null;
-            if (val !== null) {
+            if (inlineVals !== null) {
+                finalVal = unescapeXml(inlineVals.join(''));
+            } else if (val !== null) {
                 if (type === 's') {
                     const idx = parseInt(val, 10);
                     finalVal = this.sharedStrings[idx];
@@ -287,6 +468,12 @@ export class XlsxReader extends ExcelReaderAbstract {
                     finalVal = (val === '1' || val === 'true');
                 } else if (type === 'inlineStr') {
                     finalVal = unescapeXml(val);
+                } else if (type === 'str') {
+                    finalVal = unescapeXml(val);
+                } else if (type === 'e') {
+                    finalVal = unescapeXml(val);
+                } else if (type === 'd') {
+                    finalVal = parseIsoDateUtc(val) ?? unescapeXml(val);
                 } else if (type === 'n' || type === '') {
                     finalVal = parseFloat(val);
 
@@ -311,10 +498,12 @@ export class XlsxReader extends ExcelReaderAbstract {
                 }
             }
 
-            if (colIndex !== -1) {
-                this._currentRow[colIndex] = finalVal;
-                if (colIndex >= this.fieldCount) this.fieldCount = colIndex + 1;
-            }
+            // The r attribute is optional: a cell without it sits in the column after the previous one.
+            if (colIndex === -1) colIndex = nextCol;
+            nextCol = colIndex + 1;
+
+            this._currentRow[colIndex] = finalVal;
+            if (colIndex >= this.fieldCount) this.fieldCount = colIndex + 1;
         }
     }
 

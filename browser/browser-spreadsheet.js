@@ -181,6 +181,10 @@ var BrowserBigBuffer = class {
 var BrowserZip = class _BrowserZip {
   constructor() {
     this.files = [];
+    this.files = [];
+  }
+  static {
+    this._crc32Table = null;
   }
   /**
    * Add a file entry (string or Uint8Array).
@@ -298,7 +302,6 @@ var BrowserZip = class _BrowserZip {
     return (crc ^ 4294967295) >>> 0;
   }
 };
-BrowserZip._crc32Table = null;
 
 // src/Formats.ts
 var F = {
@@ -343,15 +346,61 @@ function getFormat(val) {
   return null;
 }
 
+// src/xmlUtils.ts
+function columnIndexToLetter(colIndex) {
+  let n = colIndex + 1;
+  let result = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    result = String.fromCharCode(65 + rem) + result;
+    n = Math.floor((n - 1) / 26);
+  }
+  return result;
+}
+
+// src/writerHelpers.ts
+var OA_EPOCH_1900 = Date.UTC(1899, 11, 30);
+var MARCH_1_1900 = Date.UTC(1900, 2, 1);
+function timeToOaDate(timeMs, epochMs) {
+  let serial = (timeMs - epochMs) / 864e5;
+  if (epochMs === OA_EPOCH_1900 && timeMs < MARCH_1_1900) {
+    serial -= 1;
+  }
+  return serial;
+}
+var MAX_ROWS = 1048576;
+var MAX_COLS = 16384;
+var MAX_CELL_CHARS = 32767;
+function assertCellTextLength(text) {
+  if (text.length > MAX_CELL_CHARS) {
+    throw new Error(
+      `Excel cell text exceeds ${MAX_CELL_CHARS} UTF-16 code units (got ${text.length}).`
+    );
+  }
+}
+function assertColumnCount(columnCount) {
+  if (!Number.isInteger(columnCount) || columnCount < 1 || columnCount > MAX_COLS) {
+    throw new Error(
+      `Excel column count must be 1..${MAX_COLS} (got ${columnCount}).`
+    );
+  }
+}
+function assertRowFitsColumns(kind, length, columnCount) {
+  if (length > columnCount) {
+    throw new Error(
+      `Excel ${kind} length ${length} exceeds columnCount ${columnCount}.`
+    );
+  }
+}
+function assertRowCount(totalRows) {
+  if (totalRows > MAX_ROWS) {
+    throw new Error(
+      `Excel row count exceeds ${MAX_ROWS} (got ${totalRows}).`
+    );
+  }
+}
+
 // src/browser/BrowserXlsxWriter.ts
-var COL_LETTERS = (() => {
-  const l = [];
-  for (let i = 65; i < 91; i++) l.push(String.fromCharCode(i));
-  const t = [];
-  for (const p of l) for (let i = 65; i < 91; i++) t.push(p + String.fromCharCode(i));
-  l.push(...t);
-  return l;
-})();
 var BrowserXlsxWriter = class {
   constructor() {
     this._zip = new BrowserZip();
@@ -376,7 +425,7 @@ var BrowserXlsxWriter = class {
     this._nextXf = 6;
   }
   _cl(i) {
-    return i < COL_LETTERS.length ? COL_LETTERS[i] : "A";
+    return columnIndexToLetter(i);
   }
   _san(n) {
     if (!n || typeof n !== "string") return `Sheet${this._sc + 1}`;
@@ -389,7 +438,6 @@ var BrowserXlsxWriter = class {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
   }
   _esc(s) {
-    if (typeof s !== "string") return s;
     let need = false;
     for (let i = 0; i < s.length; i++) {
       const c = s.charCodeAt(i);
@@ -399,7 +447,14 @@ var BrowserXlsxWriter = class {
       }
     }
     if (!need) return s;
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+    const escaped = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+    let out = "";
+    for (let i = 0; i < escaped.length; i++) {
+      const c = escaped.charCodeAt(i);
+      if (c <= 8 || c === 11 || c === 12 || c >= 14 && c <= 31) continue;
+      out += escaped[i];
+    }
+    return out;
   }
   _fmn(n) {
     return /[\s\-+=()!@#$%^&]/.test(n) || /^[0-9]/.test(n) ? `'${n.replace(/'/g, "''")}'` : n;
@@ -410,6 +465,7 @@ var BrowserXlsxWriter = class {
     this._sl.push({ name: sn, path: `xl/worksheets/sheet${this._sc}.xml`, hidden, fn: `sheet${this._sc}.xml`, id: this._sc, rId: `rId${this._sc}`, fhr: null });
   }
   _wsc(bb, val, cr, rn, so) {
+    assertCellTextLength(val);
     let idx = this._sstM.get(val);
     if (idx === void 0) {
       idx = this._sstA.length;
@@ -421,6 +477,7 @@ var BrowserXlsxWriter = class {
     bb.writeString(`<c r="${cr}${rn}" t="s"${sa}><v>${idx}</v></c>`);
   }
   _wscStyle(bb, val, cr, rn, styleId) {
+    assertCellTextLength(val);
     let idx = this._sstM.get(val);
     if (idx === void 0) {
       idx = this._sstA.length;
@@ -431,10 +488,11 @@ var BrowserXlsxWriter = class {
     bb.writeString(`<c r="${cr}${rn}" t="s" s="${styleId}"><v>${idx}</v></c>`);
   }
   _oa(d) {
-    return (d.getTime() - this._oaE) / 864e5;
+    return timeToOaDate(d.getTime(), this._oaE);
   }
   _regFmt(fs) {
-    if (this._fmtXf.has(fs)) return this._fmtXf.get(fs);
+    const existing = this._fmtXf.get(fs);
+    if (existing !== void 0) return existing;
     const nid = this._nextNfmt++;
     this._fmtReg.set(fs, nid);
     const xf = this._nextXf++;
@@ -444,9 +502,10 @@ var BrowserXlsxWriter = class {
   _wcv(bb, raw, cr, rn) {
     if (raw === null || raw === void 0) return;
     const fs = getFormat(raw);
-    const v = fs !== null ? unwrapCell(raw) : raw;
+    const v = unwrapCell(raw);
     const xf = fs !== null ? this._regFmt(fs) : -1;
     const sa = xf >= 0 ? ` s="${xf}"` : "";
+    if (v === null || v === void 0) return;
     if (typeof v === "number") {
       if (Number.isFinite(v)) bb.writeString(`<c r="${cr}${rn}"${sa}><v>${v}</v></c>`);
       else this._wsc(bb, v.toString(), cr, rn, xf >= 0 ? xf : void 0);
@@ -473,13 +532,19 @@ var BrowserXlsxWriter = class {
   }
   startSheet(name, colCount, headers, options = {}) {
     if (this._isS) throw new Error("Already streaming");
+    assertColumnCount(colCount);
+    if (headers !== void 0) {
+      assertRowFitsColumns("header", headers.length, colCount);
+      for (const h of headers) assertCellTextLength(h);
+    }
     const { hidden = false, doAutofilter = true, headerStyle = "bold" } = options;
     let hs = 3;
     if (headerStyle === "fill") hs = 4;
     else if (headerStyle === "bold+fill") hs = 5;
     this.addSheet(name, hidden);
     this._isS = true;
-    this._csb = new BrowserBigBuffer();
+    const csb = new BrowserBigBuffer();
+    this._csb = csb;
     this._csrn = 0;
     this._csSC = 0;
     this._csEC = colCount;
@@ -493,33 +558,37 @@ var BrowserXlsxWriter = class {
       if (w > 80) w = 80;
       if (this._cw[i] < w) this._cw[i] = w;
     }
-    this._sheetHead(this._csb, colCount, this._sc === 1, this._csAF);
+    this._sheetHead(csb, colCount, this._sc === 1, this._csAF);
     if (headers) {
       this._csrn++;
-      this._csb.writeString(`<row r="${this._csrn}">`);
-      for (let c = 0; c < headers.length; c++) this._wscStyle(this._csb, headers[c], cl[c], this._csrn, hs);
-      this._csb.writeString("</row>");
+      csb.writeString(`<row r="${this._csrn}">`);
+      for (let c = 0; c < headers.length; c++) this._wscStyle(csb, headers[c], cl[c], this._csrn, hs);
+      csb.writeString("</row>");
     }
   }
   writeRow(row) {
-    if (!this._isS) throw new Error("Not streaming");
+    if (!this._isS || this._csb === null) throw new Error("Not streaming");
+    if (row.length !== this._csEC) throw new Error(`Row length mismatch. Expected ${this._csEC} columns, got ${row.length}`);
+    const csb = this._csb;
     this._csrn++;
-    this._csb.writeString(`<row r="${this._csrn}">`);
-    for (let c = 0; c < row.length; c++) this._wcv(this._csb, row[c], this._csCL[c], this._csrn);
-    this._csb.writeString("</row>");
+    assertRowCount(this._csrn);
+    csb.writeString(`<row r="${this._csrn}">`);
+    for (let c = 0; c < row.length; c++) this._wcv(csb, row[c], this._csCL[c], this._csrn);
+    csb.writeString("</row>");
   }
   endSheet() {
-    if (!this._isS) throw new Error("Not streaming");
-    this._csb.writeString("</sheetData>");
+    if (!this._isS || this._csb === null) throw new Error("Not streaming");
+    const csb = this._csb;
+    csb.writeString("</sheetData>");
     if (this._csAF && this._csEC > 0) {
       this._afOn = true;
       const fr = `A1:${this._csCL[this._csEC - 1]}${this._csrn}`;
-      this._csb.writeString(`<autoFilter ref="${fr}"/>`);
+      csb.writeString(`<autoFilter ref="${fr}"/>`);
       const sh = this._sl[this._sc - 1];
       sh.fhr = `${this._fmn(sh.name)}!$A$1:$${this._csCL[this._csEC - 1]}$${this._csrn}`;
     }
-    this._csb.writeString("</worksheet>");
-    this._zip.addFile(this._sl[this._sc - 1].path, this._csb.toUint8Array());
+    csb.writeString("</worksheet>");
+    this._zip.addFile(this._sl[this._sc - 1].path, csb.toUint8Array());
     this._isS = false;
     this._csb = null;
   }
@@ -530,7 +599,15 @@ var BrowserXlsxWriter = class {
     if (headerStyle === "fill") hs = 4;
     else if (headerStyle === "bold+fill") hs = 5;
     const bb = new BrowserBigBuffer();
-    let cc = rows.length > 0 ? rows[0].length : headers ? headers.length : 0;
+    const cc = rows.length > 0 ? rows[0].length : headers ? headers.length : 0;
+    if (cc > 0) assertColumnCount(cc);
+    const tr = rows.length + (headers ? 1 : 0);
+    assertRowCount(tr);
+    if (headers) {
+      assertRowFitsColumns("header", headers.length, cc);
+      for (const h of headers) assertCellTextLength(h);
+    }
+    for (let r = 0; r < rows.length; r++) assertRowFitsColumns("row", rows[r].length, cc);
     this._cw = new Array(cc).fill(-1);
     const cl = new Array(cc);
     for (let i = 0; i < cc; i++) cl[i] = this._cl(i);
@@ -543,11 +620,11 @@ var BrowserXlsxWriter = class {
       const raw = rows[r][c];
       if (raw == null) continue;
       const v = isFormattedCell(raw) ? raw.value : raw;
+      if (v === null || v === void 0) continue;
       let w = 1.3 * (v instanceof Date ? 10 : v.toString().length) + 3;
       if (w > 80) w = 80;
       if (this._cw[c] < w) this._cw[c] = w;
     }
-    const tr = rows.length + (headers ? 1 : 0);
     this._sheetHead(bb, cc, this._sc === 1, doAutofilter && !!headers);
     let rn = 0;
     if (headers) {
@@ -2461,7 +2538,8 @@ var BrowserXlsbWriter = class {
     return s;
   }
   _registerFormat(fmtString) {
-    if (this._fmtMap.has(fmtString)) return this._fmtMap.get(fmtString).xf;
+    const existing = this._fmtMap.get(fmtString);
+    if (existing !== void 0) return existing.xf;
     const nid = this._nextNid++;
     const xf = this._nextXf++;
     this._fmtMap.set(fmtString, { nid, xf });
@@ -2585,6 +2663,11 @@ var BrowserXlsbWriter = class {
   }
   startSheet(sheetName, columnCount, headers, options = {}) {
     if (this._isStreaming) throw new Error("Already streaming");
+    assertColumnCount(columnCount);
+    if (headers !== void 0) {
+      assertRowFitsColumns("header", headers.length, columnCount);
+      for (const h of headers) assertCellTextLength(h);
+    }
     const { hidden = false, doAutofilter = true, headerStyle = "bold" } = options;
     let hs = 3;
     if (headerStyle === "fill") hs = 4;
@@ -2613,15 +2696,19 @@ var BrowserXlsbWriter = class {
     }
   }
   writeRow(row) {
-    if (!this._isStreaming) throw new Error("Not streaming");
     const bb = this._currentSheetBuffer;
+    if (!this._isStreaming || bb === null) throw new Error("Not streaming");
+    if (row.length !== this._currentSheetEndCol - this._currentSheetStartCol) {
+      throw new Error(`Row length mismatch. Expected ${this._currentSheetEndCol - this._currentSheetStartCol} columns, got ${row.length}`);
+    }
+    assertRowCount(this._currentSheetRowNum + 1);
     this.createRowHeader(bb, this._currentSheetRowNum, this._currentSheetStartCol, this._currentSheetEndCol);
     for (let c = 0; c < row.length; c++) this._writeCell(bb, row[c], c);
     this._currentSheetRowNum++;
   }
   endSheet() {
-    if (!this._isStreaming) throw new Error("Not streaming");
     const bb = this._currentSheetBuffer;
+    if (!this._isStreaming || bb === null) throw new Error("Not streaming");
     bb.write(this._sheet1Bytes.subarray(218, 290));
     if (this._currentSheetDoAutofilter) {
       this._autofilterIsOn = true;
@@ -2656,7 +2743,15 @@ var BrowserXlsbWriter = class {
     if (headerStyle === "fill") hs = 4;
     else if (headerStyle === "bold+fill") hs = 5;
     const bb = new BrowserBigBuffer();
-    let colCount = rows.length > 0 ? rows[0].length : headers ? headers.length : 0;
+    const colCount = rows.length > 0 ? rows[0].length : headers ? headers.length : 0;
+    if (colCount > 0) assertColumnCount(colCount);
+    const totalBr = rows.length + (headers ? 1 : 0);
+    assertRowCount(totalBr);
+    if (headers) {
+      assertRowFitsColumns("header", headers.length, colCount);
+      for (const h of headers) assertCellTextLength(h);
+    }
+    for (let r = 0; r < rows.length; r++) assertRowFitsColumns("row", rows[r].length, colCount);
     this._colWidths = new Array(colCount).fill(-1);
     if (headers) {
       for (let i = 0; i < colCount; i++) {
@@ -2671,6 +2766,7 @@ var BrowserXlsbWriter = class {
         const raw = rows[r][c];
         if (raw == null) continue;
         const v = isFormattedCell(raw) ? raw.value : raw;
+        if (v === null || v === void 0) continue;
         const len = v instanceof Date ? 10 : v.toString().length;
         let w = 1.3 * len + 3;
         if (w > 80) w = 80;
@@ -2748,7 +2844,7 @@ var BrowserXlsbWriter = class {
   _writeCell(bb, raw, c) {
     if (raw === null || raw === void 0) return;
     const fmtString = getFormat(raw);
-    const val = fmtString !== null ? unwrapCell(raw) : raw;
+    const val = unwrapCell(raw);
     const styleNum = fmtString !== null ? this._registerFormat(fmtString) : 0;
     if (typeof val === "number") {
       if (Number.isInteger(val) && val >= this._rRkIntegerLowerLimit && val <= this._rRkIntegerUpperLimit) {
@@ -2761,9 +2857,9 @@ var BrowserXlsbWriter = class {
     } else if (typeof val === "boolean") {
       this.writeBool(bb, val, c);
     } else if (val instanceof Date) {
-      const oaDate = (val.getTime() - this._oaEpoch) / 864e5;
+      const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
       this.writeDouble(bb, oaDate, c, fmtString !== null ? styleNum : 1);
-    } else {
+    } else if (val !== null && val !== void 0) {
       this.writeString(bb, val.toString(), c, 0, fmtString !== null ? styleNum : void 0);
     }
   }
@@ -2816,13 +2912,12 @@ var BrowserXlsbWriter = class {
     bb.writeUnsafeByte(val ? 1 : 0);
   }
   writeDateTime(bb, date, colNum) {
-    this.writeDouble(bb, (date.getTime() - this._oaEpoch) / 864e5, colNum, 1);
+    this.writeDouble(bb, timeToOaDate(date.getTime(), this._oaEpoch), colNum, 1);
   }
-  writeString(bb, val, colNum, styleIndex = 0, styleOverride = void 0) {
-    let index;
-    if (this._sstDic.has(val)) {
-      index = this._sstDic.get(val);
-    } else {
+  writeString(bb, val, colNum, styleIndex = 0, styleOverride) {
+    assertCellTextLength(val);
+    let index = this._sstDic.get(val);
+    if (index === void 0) {
       index = this._sstCntUnique++;
       this._sstDic.set(val, index);
     }
@@ -2843,8 +2938,8 @@ var BrowserXlsbWriter = class {
     bb.writeByte(159);
     bb.writeByte(1);
     bb.writeByte(8);
-    bb.writeInt32LE(this._sstCntUnique);
     bb.writeInt32LE(this._sstCntAll);
+    bb.writeInt32LE(this._sstCntUnique);
     for (const [txt] of this._sstDic) {
       const tl = txt.length;
       bb.writeByte(19);
@@ -2920,7 +3015,7 @@ var BrowserXlsbWriter = class {
     }
     wbBuffers.push(this._workbookBinMiddle);
     if (this._autofilterIsOn) {
-      const filtered = this._sheetList.filter((s) => s.filterData);
+      const filtered = this._sheetList.filter((s) => s.filterData !== void 0);
       if (filtered.length > 0) {
         wbBuffers.push(this._magicFilterExcel2016Fix0);
         const cnt = filtered.length;

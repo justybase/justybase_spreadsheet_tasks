@@ -12,7 +12,9 @@ import {
     parseSharedStringsBin,
     Biff12Record,
 } from './biff12Utils';
-import { trimTrailingEmptyRows } from './xmlUtils';
+import { BiffReaderWriter } from './BiffReaderWriter';
+import { trimTrailingEmptyRows, parseTagAttributes, resolveRelTarget } from './xmlUtils';
+import { timeToOaDate } from './writerHelpers';
 
 /**
  * Options for {@link XlsbUpdater.replaceSheetData}.
@@ -73,7 +75,7 @@ export class XlsbUpdater {
     private stringIndexMap: Map<string, number> = new Map();
     private sharedStringsDirty: boolean = false;
 
-    private readonly _oaEpoch: number;
+    private _oaEpoch: number;
 
     /**
      * @param path Path to an existing `.xlsb` file.
@@ -170,7 +172,7 @@ export class XlsbUpdater {
             newSheet.writeInt32LE(lastRowIdx, newAf + 4);
         }
 
-        // Keep the sheet dimension record (0x98) in sync with the new data. Excel uses
+        // Keep the sheet dimension record (0x94) in sync with the new data. Excel uses
         // its rwLast/colLast fields to read the full row range; stale values make the
         // last written row invisible (and drop it from pivot refreshes).
         this._patchDimension(newSheet, lastRowIdx, lastCol);
@@ -185,6 +187,7 @@ export class XlsbUpdater {
         const rwLast = Math.max(0, rows.length + (headers ? 1 : 0) - 1);
         const colLast = lastCol;
         this._patchPivotCaches(sheetName, rwLast, colLast);
+        this._removeCalcChain();
     }
 
     /** Replace worksheet rows from a one-pass source. */
@@ -388,6 +391,7 @@ export class XlsbUpdater {
                 Math.max(0, keptDataRows + (headers !== undefined ? 1 : 0) - 1),
                 lastCol,
             );
+            this._removeCalcChain();
 
             if (oldStage && oldStage !== outputPath) this._removeTemporaryFile(oldStage);
             createdParts.splice(createdParts.indexOf(outputPath), 1);
@@ -526,10 +530,15 @@ export class XlsbUpdater {
         const rIdToTarget: Record<string, string> = {};
         if (relsEntry) {
             const rels = relsEntry.getData().toString('utf8');
-            const relRegex = /<Relationship[^>]*Id="([^"]*)"[^>]*Target="([^"]*)"/g;
-            let match;
-            while ((match = relRegex.exec(rels)) !== null) {
-                rIdToTarget[match[1]] = match[2];
+            const relTagRe = /<Relationship\b[^>]*>/g;
+            let tagMatch;
+            while ((tagMatch = relTagRe.exec(rels)) !== null) {
+                const attrs = parseTagAttributes(tagMatch[0]);
+                const id = attrs['Id'] ?? attrs['id'];
+                const target = attrs['Target'] ?? attrs['target'];
+                if (id !== undefined && target !== undefined) {
+                    rIdToTarget[id] = target;
+                }
             }
         }
 
@@ -553,11 +562,26 @@ export class XlsbUpdater {
                 const name = readUtf16(wbBuf, o, nameLen);
 
                 let target = rIdToTarget[rId] ?? '';
-                if (target.startsWith('/')) target = target.substring(1);
-                else if (!target.startsWith('xl/')) target = 'xl/' + target;
+                target = resolveRelTarget(target);
                 if (target) {
                     this.sheetNameToPath.set(name, target);
                 }
+            }
+            // 1904 date system: BrtWbProp (0x99) bit0 f1904.
+            try {
+                const rec1904: Biff12Record = { headerStart: 0, dataStart: 0, dataEnd: 0, id: 0, len: 0 };
+                let p1904 = 0;
+                while (readRecord(wbBuf, p1904, rec1904)) {
+                    if (rec1904.id === 0x99 && rec1904.len >= 4) {
+                        const is1904 = (wbBuf[rec1904.dataStart] & 0x01) !== 0;
+                        this._oaEpoch =
+                            is1904 ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
+                        break;
+                    }
+                    p1904 = rec1904.dataEnd;
+                }
+            } catch {
+                // Keep default epoch.
             }
         }
 
@@ -690,30 +714,22 @@ export class XlsbUpdater {
     private _findDateXf(): number | null {
         const entry = this.zip.getEntry('xl/styles.bin');
         if (!entry) return null;
-        const stylesBuf = entry.getData();
-
-        const rec: Biff12Record = { headerStart: 0, dataStart: 0, dataEnd: 0, id: 0, len: 0 };
-        let pos = 0;
-        let inCellXfs = false;
-        let xfIndex = 0;
-        while (readRecord(stylesBuf, pos, rec)) {
-            pos = rec.dataEnd;
-            if (rec.id === 0x0269) {
-                inCellXfs = true;
-                xfIndex = 0;
-                continue;
-            }
-            if (rec.id === 0x026a) {
-                inCellXfs = false;
-                continue;
-            }
-            if (inCellXfs && rec.id === 0x002f && rec.len >= 4) {
-                const numFmtId = stylesBuf.readUInt16LE(rec.dataStart + 2);
-                const isDate =
-                    (numFmtId >= 14 && numFmtId <= 22) ||
-                    (numFmtId >= 45 && numFmtId <= 47);
-                if (isDate) return xfIndex;
-                xfIndex++;
+        // Reuse the styles parser (handles custom BrtFmt date formats, e.g.
+        // xlspy's yyyy-mm-dd), instead of only built-in numFmt ranges.
+        const reader = new BiffReaderWriter(entry.getData());
+        while (reader.readStyles()) {
+            // Consume; results accumulate on the reader.
+        }
+        const numFmtIds = reader._xfIndexToNumFmtId;
+        const customDates = reader._customNumFmts;
+        for (let i = 0; i < numFmtIds.length; i++) {
+            const numFmtId = numFmtIds[i];
+            if (
+                (numFmtId >= 14 && numFmtId <= 22) ||
+                (numFmtId >= 45 && numFmtId <= 47) ||
+                customDates.has(numFmtId)
+            ) {
+                return i;
             }
         }
         return null;
@@ -814,7 +830,7 @@ export class XlsbUpdater {
             return buildRecord(0x0004, payload);
         }
         if (val instanceof Date) {
-            const oaDate = (val.getTime() - this._oaEpoch) / 86400000;
+            const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
             if (Number.isFinite(oaDate)) {
                 const style = colStyle > 0 ? colStyle : (dateXf !== null ? dateXf : 0);
                 const payload = Buffer.alloc(16);
@@ -897,10 +913,12 @@ export class XlsbUpdater {
             const rec: Biff12Record = { headerStart: 0, dataStart: 0, dataEnd: 0, id: 0, len: 0 };
             let pos = 0;
             while (readRecord(originalSheet, pos, rec)) {
-                if (rec.id === 0x0098 && rec.len >= 36) {
+                // BrtWsDim (0x94), not BrtSel (0x98): 16-byte payload
+                // [rwFirst(4), rwLast(4), colFirst(4), colLast(4)].
+                if (rec.id === 0x0094 && rec.len >= 16) {
                     const shift = rec.dataStart >= rowsEnd ? delta : 0;
-                    patchInt32(rec.dataStart + shift + 24, lastRowIdx);
-                    patchInt32(rec.dataStart + shift + 32, lastCol);
+                    patchInt32(rec.dataStart + shift + 4, lastRowIdx);
+                    patchInt32(rec.dataStart + shift + 12, lastCol);
                     break;
                 }
                 pos = rec.dataEnd;
@@ -952,8 +970,8 @@ export class XlsbUpdater {
     }
 
     /**
-     * Keep the sheet dimension record (0x98) in sync with the new data.
-     * Excel uses its rwLast (payload offset 24) and colLast (payload offset 32)
+     * Keep the sheet dimension record (0x94) in sync with the new data.
+     * Excel uses its rwLast (payload offset 4) and colLast (payload offset 12)
      * fields to read the full row range; stale values make the last written row
      * invisible to Excel (and drop it from pivot refreshes).
      */
@@ -961,9 +979,9 @@ export class XlsbUpdater {
         const rec: Biff12Record = { headerStart: 0, dataStart: 0, dataEnd: 0, id: 0, len: 0 };
         let pos = 0;
         while (readRecord(sheetBuf, pos, rec)) {
-            if (rec.id === 0x0098 && rec.len >= 36) {
-                sheetBuf.writeInt32LE(lastRowIdx, rec.dataStart + 24);
-                sheetBuf.writeInt32LE(lastCol, rec.dataStart + 32);
+            if (rec.id === 0x0094 && rec.len >= 16) {
+                sheetBuf.writeInt32LE(lastRowIdx, rec.dataStart + 4);
+                sheetBuf.writeInt32LE(lastCol, rec.dataStart + 12);
                 return;
             }
             pos = rec.dataEnd;
@@ -1017,6 +1035,84 @@ export class XlsbUpdater {
             if (patched) {
                 this.zip.updateFile(path, buf);
             }
+        }
+    }
+
+    /**
+     * Remove the stale calculation chain (xl/calcChain.bin). Excel rebuilds it
+     * on open. Removes the part, its Content_Types override and its workbook
+     * rels entry. XLSB tables are not patched (documented limitation).
+     */
+    private _removeCalcChain(): void {
+        const calcPath = 'xl/calcChain.bin';
+        if (!this.zip.getEntry(calcPath) && !this.stagedParts.has(calcPath)) return;
+        try {
+            this.zip.deleteFile(calcPath);
+        } catch {
+            // Best-effort.
+        }
+        const stagedCalc = this.stagedParts.get(calcPath);
+        if (stagedCalc) {
+            this.stagedParts.delete(calcPath);
+            try {
+                fs.rmSync(stagedCalc, { force: true });
+            } catch {
+                // Best-effort.
+            }
+        }
+
+        // XLSB declares non-workbook .bin parts with an Override (the Default
+        // "bin" content type is the workbook itself), so remove that too.
+        const ctPath = '[Content_Types].xml';
+        if (this.zip.getEntry(ctPath) || this.stagedParts.has(ctPath)) {
+            try {
+                const ct = this._entryData(ctPath).toString('utf8');
+                const updated = ct.replace(
+                    /<Override\b[^>]*PartName="\/xl\/calcChain\.bin"[^>]*\/?>/gi,
+                    '',
+                );
+                if (updated !== ct) this._writePartText(ctPath, updated);
+            } catch {
+                // Best-effort.
+            }
+        }
+
+        const relsPath = 'xl/_rels/workbook.bin.rels';
+        if (this.zip.getEntry(relsPath) || this.stagedParts.has(relsPath)) {
+            try {
+                const rels = this._entryData(relsPath).toString('utf8');
+                const relTagRe = /<Relationship\b[^>]*>/g;
+                let m: RegExpExecArray | null;
+                let out = '';
+                let last = 0;
+                let changed = false;
+                while ((m = relTagRe.exec(rels)) !== null) {
+                    const attrs = parseTagAttributes(m[0]);
+                    const type = attrs['Type'] ?? attrs['type'] ?? '';
+                    const target = attrs['Target'] ?? attrs['target'] ?? '';
+                    if (type.endsWith('/calcChain') && resolveRelTarget(target) === 'xl/calcChain.bin') {
+                        out += rels.substring(last, m.index);
+                        last = m.index + m[0].length;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    out += rels.substring(last);
+                    this._writePartText(relsPath, out);
+                }
+            } catch {
+                // Best-effort.
+            }
+        }
+    }
+
+    /** Write an XML/text part to its staged file when present, else into the ZIP. */
+    private _writePartText(name: string, text: string): void {
+        const stagedPath = this.stagedParts.get(name);
+        if (stagedPath) {
+            fs.writeFileSync(stagedPath, text, 'utf8');
+        } else {
+            this.zip.updateFile(name, Buffer.from(text, 'utf8'));
         }
     }
 }

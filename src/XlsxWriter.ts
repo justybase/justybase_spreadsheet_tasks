@@ -1,4 +1,6 @@
 import * as fs from 'fs';
+import * as path from 'path';
+import { randomUUID } from 'crypto';
 import archiver from 'archiver';
 import { Readable } from 'stream';
 import { BigBuffer } from './BigBuffer';
@@ -10,22 +12,13 @@ import {
     applyHeaderWidths,
     updateColWidthsFromRows,
     defaultColWidth,
+    assertCellTextLength,
+    assertColumnCount,
+    assertRowFitsColumns,
+    assertRowCount,
+    timeToOaDate,
 } from './writerHelpers';
-
-const COLUMN_LETTERS = (() => {
-    const letters: string[] = [];
-    for (let i = 65; i < 91; i++) {
-        letters.push(String.fromCharCode(i));
-    }
-    const temp: string[] = [];
-    for (const p of letters) {
-        for (let i = 65; i < 91; i++) {
-            temp.push(p + String.fromCharCode(i));
-        }
-    }
-    letters.push(...temp);
-    return letters;
-})();
+import { columnIndexToLetter } from './xmlUtils';
 
 interface SheetInfo {
     name: string;
@@ -43,6 +36,10 @@ interface SheetInfo {
 export class XlsxWriter {
     private output: fs.WriteStream;
     private archive: archiver.Archiver;
+    private readonly _targetPath: string;
+    private readonly _tempPath: string;
+    private _outputError: Error | null = null;
+    private _finalized: boolean = false;
 
     private sheetCount: number = 0;
     private sheetList: SheetInfo[] = [];
@@ -66,8 +63,16 @@ export class XlsxWriter {
      * @param filePath Destination `.xlsx` path on disk.
      */
     constructor(filePath: string) {
-        this.output = fs.createWriteStream(filePath);
+        this._targetPath = path.resolve(filePath);
+        fs.mkdirSync(path.dirname(this._targetPath), { recursive: true });
+        this._tempPath = path.join(
+            path.dirname(this._targetPath),
+            `.${path.basename(this._targetPath)}.${randomUUID()}.tmp`
+        );
+        this.output = fs.createWriteStream(this._tempPath);
+        this.output.on('error', (err: Error) => { this._outputError = err; });
         this.archive = archiver('zip');
+        this.archive.on('error', (err: Error) => { this._outputError = err; });
 
         this.archive.pipe(this.output);
 
@@ -75,7 +80,7 @@ export class XlsxWriter {
     }
 
     private _getColumnLetter(colIndex: number): string {
-        return colIndex < COLUMN_LETTERS.length ? COLUMN_LETTERS[colIndex] : 'A';
+        return columnIndexToLetter(colIndex);
     }
 
     /** @deprecated Internal; kept for unit-test access. Prefer sanitizeSheetName(). */
@@ -153,6 +158,12 @@ export class XlsxWriter {
         headers?: string[],
         options: { hidden?: boolean; doAutofilter?: boolean; sampleRows?: unknown[][] } = {}
     ): void {
+        assertColumnCount(columnCount);
+        if (headers !== undefined) {
+            assertRowFitsColumns('header', headers.length, columnCount);
+            for (const h of headers) assertCellTextLength(h);
+        }
+
         const { hidden = false, doAutofilter = true, sampleRows } = options;
 
         this.addSheet(sheetName, hidden);
@@ -222,6 +233,7 @@ export class XlsxWriter {
         }
 
         this.stream.rowNum++;
+        assertRowCount(this.stream.rowNum);
         bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
 
         for (let c = 0; c < row.length; c++) {
@@ -297,6 +309,17 @@ export class XlsxWriter {
             columnCount = headers.length;
         }
 
+        if (columnCount > 0) assertColumnCount(columnCount);
+        const totalRows = rows.length + (headers ? 1 : 0);
+        assertRowCount(totalRows);
+        if (headers) {
+            assertRowFitsColumns('header', headers.length, columnCount);
+            for (const h of headers) assertCellTextLength(h);
+        }
+        for (let r = 0; r < rows.length; r++) {
+            assertRowFitsColumns('row', rows[r].length, columnCount);
+        }
+
         const colWidths = initColWidths(columnCount);
 
         const colLetters = new Array(columnCount);
@@ -312,7 +335,6 @@ export class XlsxWriter {
         bigBuf.writeString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
         bigBuf.writeString('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">');
 
-        const totalRows = rows.length + (headers ? 1 : 0);
         if (totalRows > 0 && columnCount > 0) {
             bigBuf.writeString(`<dimension ref="A1:${colLetters[columnCount - 1]}${totalRows}"/>`);
         } else {
@@ -411,6 +433,7 @@ export class XlsxWriter {
     }
 
     private _writeStringCell(bigBuf: BigBuffer, val: string, colRef: string, rowNum: number, styleOverride?: number): void {
+        assertCellTextLength(val);
         let index = this.sstMap.get(val);
         if (index === undefined) {
             index = this.sstArray.length;
@@ -434,8 +457,9 @@ export class XlsxWriter {
     }
 
     private _toOADate(date: Date): number {
-        // Use UTC time to avoid timezone conversion issues
-        return (date.getTime() - this._oaEpoch) / 86400000;
+        // Use UTC time to avoid timezone conversion issues; handles the
+        // fictitious 1900-02-29 (dates before 1900-03-01 serialize one lower).
+        return timeToOaDate(date.getTime(), this._oaEpoch);
     }
 
     private _getDateWidth(_date: Date): number {
@@ -445,24 +469,68 @@ export class XlsxWriter {
     /** Finalize the ZIP package and close the output stream. */
     finalize(): Promise<void> {
         return new Promise((resolve, reject) => {
+            if (this._finalized) {
+                reject(new Error('XlsxWriter: already finalized'));
+                return;
+            }
+            this._finalized = true;
+            let settled = false;
+            const cleanupTemp = (): void => {
+                try {
+                    if (fs.existsSync(this._tempPath)) fs.rmSync(this._tempPath);
+                } catch {
+                    // Preserve original error.
+                }
+            };
+            const fail = (err: unknown): void => {
+                if (settled) return;
+                settled = true;
+                try { this.archive.abort(); } catch { /* preserve */ }
+                try { this.output.destroy(); } catch { /* preserve */ }
+                cleanupTemp();
+                reject(err instanceof Error ? err : new Error(String(err)));
+            };
+            const succeed = (): void => {
+                if (settled) return;
+                if (this._outputError) {
+                    fail(this._outputError);
+                    return;
+                }
+                settled = true;
+                try {
+                    // Ensure data hits disk before publishing (xlspy parity, no fsync of dir).
+                    const fd = fs.openSync(this._tempPath, 'r+');
+                    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+                    // Preserve the mode of a file being replaced (the temp file
+                    // was created with the process umask).
+                    try {
+                        const existing = fs.statSync(this._targetPath);
+                        fs.chmodSync(this._tempPath, existing.mode & 0o777);
+                    } catch {
+                        // Target does not exist yet.
+                    }
+                    fs.renameSync(this._tempPath, this._targetPath);
+                    resolve();
+                } catch (err) {
+                    cleanupTemp();
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                }
+            };
             try {
+                if (this._outputError) throw this._outputError;
                 this._writeSharedStrings();
                 this._writeStyles();
                 this._writeWorkbook();
                 this._writeContentTypes();
                 this._writeRels();
 
-                this.output.on('close', () => {
-                    resolve();
-                });
-
-                this.archive.on('error', (err: any) => {
-                    reject(err);
-                });
+                this.output.once('close', succeed);
+                this.output.once('error', fail);
+                this.archive.once('error', fail);
 
                 this.archive.finalize();
             } catch (err) {
-                reject(err);
+                fail(err);
             }
         });
     }

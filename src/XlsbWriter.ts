@@ -1,4 +1,6 @@
 import * as fs from 'fs';
+import * as path from 'path';
+import { randomUUID } from 'crypto';
 import archiver from 'archiver';
 import { Readable } from 'stream';
 import { BigBuffer } from './BigBuffer';
@@ -10,6 +12,11 @@ import {
     applyHeaderWidths,
     updateColWidthsFromRows,
     defaultColWidth,
+    assertCellTextLength,
+    assertColumnCount,
+    assertRowFitsColumns,
+    assertRowCount,
+    timeToOaDate,
 } from './writerHelpers';
 
 interface SheetInfo {
@@ -34,6 +41,10 @@ interface SheetInfo {
 export class XlsbWriter {
     private output: fs.WriteStream;
     private archive: ReturnType<typeof archiver>;
+    private readonly _targetPath: string;
+    private readonly _tempPath: string;
+    private _outputError: Error | null = null;
+    private _finalized: boolean = false;
 
     private sheetCount: number = 0;
     private sheetList: SheetInfo[] = [];
@@ -72,8 +83,16 @@ export class XlsbWriter {
      * @param filePath Destination `.xlsb` path on disk.
      */
     constructor(filePath: string) {
-        this.output = fs.createWriteStream(filePath);
+        this._targetPath = path.resolve(filePath);
+        fs.mkdirSync(path.dirname(this._targetPath), { recursive: true });
+        this._tempPath = path.join(
+            path.dirname(this._targetPath),
+            `.${path.basename(this._targetPath)}.${randomUUID()}.tmp`
+        );
+        this.output = fs.createWriteStream(this._tempPath);
+        this.output.on('error', (err: Error) => { this._outputError = err; });
         this.archive = archiver('zip');
+        this.archive.on('error', (err: Error) => { this._outputError = err; });
 
         this.archive.pipe(this.output);
 
@@ -424,6 +443,11 @@ export class XlsbWriter {
         headers?: string[],
         options: { hidden?: boolean; doAutofilter?: boolean; sampleRows?: unknown[][] } = {}
     ): void {
+        assertColumnCount(columnCount);
+        if (headers !== undefined) {
+            assertRowFitsColumns('header', headers.length, columnCount);
+            for (const h of headers) assertCellTextLength(h);
+        }
         const { hidden = false, doAutofilter = true, sampleRows } = options;
 
         // Add sheet metadata
@@ -513,6 +537,7 @@ export class XlsbWriter {
                 `Row length mismatch. Expected ${this.stream.endCol - this.stream.startCol} columns, got ${row.length}`
             );
         }
+        assertRowCount(this.stream.rowNum + 1);
 
         // Write row header
         this.createRowHeader(bigBuf, this.stream.rowNum, this.stream.startCol, this.stream.endCol);
@@ -541,7 +566,7 @@ export class XlsbWriter {
             } else if (typeof val === 'boolean') {
                 this.writeBool(bigBuf, val, c);
             } else if (val instanceof Date) {
-                const oaDate = (val.getTime() - this._oaEpoch) / 86400000;
+                const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
                 this.writeDouble(bigBuf, oaDate, c, fmtString !== null ? styleNum : 1);
             } else if (val !== null && val !== undefined) {
                 this.writeString(bigBuf, val.toString(), c, false, fmtString !== null ? styleNum : undefined);
@@ -617,6 +642,17 @@ export class XlsbWriter {
             columnCount = rows[0].length;
         } else if (headers) {
             columnCount = headers.length;
+        }
+
+        if (columnCount > 0) assertColumnCount(columnCount);
+        const totalRowsCheck = rows.length + (headers ? 1 : 0);
+        assertRowCount(totalRowsCheck);
+        if (headers) {
+            assertRowFitsColumns('header', headers.length, columnCount);
+            for (const h of headers) assertCellTextLength(h);
+        }
+        for (let r = 0; r < rows.length; r++) {
+            assertRowFitsColumns('row', rows[r].length, columnCount);
         }
 
         const colWidths = initColWidths(columnCount);
@@ -714,7 +750,7 @@ export class XlsbWriter {
                 } else if (typeof val === 'boolean') {
                     this.writeBool(bigBuf, val, c);
                 } else if (val instanceof Date) {
-                    const oaDate = (val.getTime() - this._oaEpoch) / 86400000;
+                    const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
                     this.writeDouble(bigBuf, oaDate, c, fmtString !== null ? styleNum : 1);
                 } else if (val !== null && val !== undefined) {
                     this.writeString(bigBuf, val.toString(), c, false, fmtString !== null ? styleNum : undefined);
@@ -813,8 +849,9 @@ export class XlsbWriter {
     }
 
     writeDateTime(bigBuf: BigBuffer, date: Date, colNum: number): void {
-        // Use UTC time to avoid timezone conversion issues
-        const oaDate = (date.getTime() - this._oaEpoch) / 86400000;
+        // Use UTC time to avoid timezone conversion issues; handles the
+        // fictitious 1900-02-29.
+        const oaDate = timeToOaDate(date.getTime(), this._oaEpoch);
         this.writeDouble(bigBuf, oaDate, colNum, 1);
     }
 
@@ -823,6 +860,7 @@ export class XlsbWriter {
     }
 
     writeString(bigBuf: BigBuffer, val: string, colNum: number, bolded: boolean = false, styleOverride?: number): void {
+        assertCellTextLength(val);
         let index: number;
         if (this.sstDic.has(val)) {
             index = this.sstDic.get(val)!;
@@ -852,8 +890,8 @@ export class XlsbWriter {
         bigBuf.writeByte(1);
         bigBuf.writeByte(8);
 
-        bigBuf.writeInt32LE(this.sstCntUnique);
         bigBuf.writeInt32LE(this.sstCntAll);
+        bigBuf.writeInt32LE(this.sstCntUnique);
 
         for (const [txt] of this.sstDic) {
             const txtLen = txt.length;
@@ -923,7 +961,54 @@ export class XlsbWriter {
      */
     finalize(): Promise<void> {
         return new Promise((resolve, reject) => {
+            if (this._finalized) {
+                reject(new Error('XlsbWriter: already finalized'));
+                return;
+            }
+            this._finalized = true;
+            let settled = false;
+            const cleanupTemp = (): void => {
+                try {
+                    if (fs.existsSync(this._tempPath)) fs.rmSync(this._tempPath);
+                } catch {
+                    // Preserve original error.
+                }
+            };
+            const fail = (err: unknown): void => {
+                if (settled) return;
+                settled = true;
+                try { this.archive.abort(); } catch { /* preserve */ }
+                try { this.output.destroy(); } catch { /* preserve */ }
+                cleanupTemp();
+                reject(err instanceof Error ? err : new Error(String(err)));
+            };
+            const succeed = (): void => {
+                if (settled) return;
+                if (this._outputError) {
+                    fail(this._outputError);
+                    return;
+                }
+                settled = true;
+                try {
+                    const fd = fs.openSync(this._tempPath, 'r+');
+                    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+                    // Preserve the mode of a file being replaced (the temp file
+                    // was created with the process umask).
+                    try {
+                        const existing = fs.statSync(this._targetPath);
+                        fs.chmodSync(this._tempPath, existing.mode & 0o777);
+                    } catch {
+                        // Target does not exist yet.
+                    }
+                    fs.renameSync(this._tempPath, this._targetPath);
+                    resolve();
+                } catch (err) {
+                    cleanupTemp();
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                }
+            };
             try {
+                if (this._outputError) throw this._outputError;
                 this.saveSst();
 
                 this.archive.append(this._buildStylesBin(), { name: 'xl/styles.bin' });
@@ -1038,11 +1123,12 @@ export class XlsbWriter {
                     this.archive.append(wsRels, { name: `xl/worksheets/_rels/${sheet.nameInArchive}.rels` });
                 }
 
-                this.output.on('close', () => resolve());
-                this.archive.on('error', (err: any) => reject(err));
+                this.output.once('close', succeed);
+                this.output.once('error', fail);
+                this.archive.once('error', fail);
                 this.archive.finalize();
             } catch (err) {
-                reject(err);
+                fail(err);
             }
         });
     }
