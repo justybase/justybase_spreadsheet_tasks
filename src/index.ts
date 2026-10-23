@@ -44,5 +44,24 @@ export {
     updateColWidthsFromRows,
     defaultColWidth,
     INVALID_SHEET_NAME_CHARS,
+    MAX_ROWS,
+    MAX_COLS,
+    MAX_CELL_CHARS,
+    assertCellTextLength,
+    assertColumnCount,
+    assertRowFitsColumns,
+    assertRowCount,
 } from './writerHelpers';
 export { StreamingSheetState } from './StreamingSheetState';
+
+// Shared XML helpers (tag attributes, rel targets, column letters)
+export {
+    escapeXmlText,
+    unescapeXml,
+    columnIndexToLetter,
+    columnLetterToIndex,
+    parseSharedStringsXml,
+    trimTrailingEmptyRows,
+    parseTagAttributes,
+    resolveRelTarget,
+} from './xmlUtils';

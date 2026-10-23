@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- `XlsxReader` / `XlsbReader` now return an empty row (`[]`, `getValue()` → `null`)
+  for every missing row position, including leading gaps, based on the row `r`
+  attribute (XLSX) and `BrtRowHdr` (XLSB). Like xlspy, gap positions are yielded;
+  unlike xlspy's padded `[None] * cols`, this reader yields a zero-length row.
+  Code that counts rows must account for gap rows.
+
+### Documentation
+
+- Date conversion is UTC-based on both write and read: a `Date` is stored by its
+  UTC instant (`getTime()`), so `new Date(2024, 5, 30)` in UTC+2 appears as
+  2024-06-29 22:00 in Excel. Use `Date.UTC(...)` for date-only values.
+
 ### Added
 
+- `selectSheet(nameOrIndex)` and `nextResult()` on `ExcelReaderAbstract`,
+  implemented by `XlsxReader` and `XlsbReader`. Default remains sheet 0; state
+  (row/EOF, `fieldCount`) resets on selection.
+- Excel limits (`MAX_ROWS=1_048_576`, `MAX_COLS=16_384`, `MAX_CELL_CHARS=32_767`
+  UTF-16 units) enforced in `XlsxWriter`, `XlsbWriter`, `BrowserXlsxWriter` and
+  `BrowserXlsbWriter`. Overlong text, oversized dimensions and rows/headers
+  longer than `columnCount` throw instead of writing corrupt files (xlspy parity).
+- Shared XML helpers: `parseTagAttributes()`, `resolveRelTarget()` and
+  single-pass `unescapeXml()` in `src/xmlUtils.ts`, exported from the package
+  entry point.
 - `convertXlsbToXlsx` and `convertXlsxToXlsb` — Windows/Excel COM conversions
   with protected destinations and optional explicit overwriting.
 - `replaceSheetDataStream()` and `saveStreaming()` for XLSX/XLSB updaters,
@@ -19,6 +43,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `BrowserXlsxWriter` / `BrowserXlsbWriter` skip a `FormattedCell` whose value is
+  `null` or `undefined`, matching the Node writers (previously a `TypeError`).
+- Browser sources in `src/browser/` are type-checked under `strict` by
+  `tsconfig.browser.json`, which `npm run typecheck` runs. The `@ts-nocheck` pragmas
+  were removed.
+- Column letters ≥702 (`AAA`…`XFD`): `XlsxWriter` and `BrowserXlsxWriter` now
+  delegate to `columnIndexToLetter()` instead of falling back to `'A'`.
+- XLSB shared-string table: `BrtBeginSst` now writes `total` then `unique`
+  (was swapped); `BiffReaderWriter` and updaters already expected that order.
+- Writer finalization is atomic: output goes to a same-directory temp file,
+  output/archive errors reject the promise, streams are destroyed and the temp
+  file removed; only a complete workbook is renamed into place (xlspy parity).
+  `writeAdmZipStreaming()` now observes output errors before/during the append loop.
+- Workbook relationships and sheet paths: absolute `Target="/xl/…"` resolved
+  correctly, attribute order no longer matters (`parseTagAttributes` used in
+  both readers and both updaters). Verified against openpyxl output.
+- `unescapeXml()` single-pass: `&amp;lt;` stays `&lt;` instead of becoming `<`.
+- Shared strings: `<rPh>` phonetics skipped, `<si/>` yields `""`, rich-text
+  `inlineStr` concatenates all `<t>` runs.
+- XLSX cell types: `t="str"` → text, `t="e"` → error text, `t="d"` → `Date`.
+- Self-closing `<row …/>` no longer swallows the next row.
+- 1904 date system: `workbookPr date1904` (XLSX) and `BrtWbProp` (XLSB) set the
+  reader/updater epoch (`1904-01-01` vs `1899-12-30`).
+- XLSB dimension: updaters patch `BrtWsDim` (`0x94`, `rwLast@4`/`colLast@12`)
+  instead of `BrtSel` (`0x98`).
+- Stale parts after `replaceSheetData`: `xl/calcChain.xml` (`.bin` for XLSB)
+  removed with its `Content_Types`/rels entries; XLSX `xl/tables/*.xml` refs
+  (`<table>` + `<autoFilter>`) updated to the new dimension when the table's
+  width is unchanged, without expanding over other tables. XLSB tables are not
+  patched (documented limitation).
 - Destination replacement during Excel conversion now preserves files created
   concurrently and rolls back safely when the final rename fails.
 - Shared-string `count` values now reflect the replaced worksheet rather than
@@ -26,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed only once.
 - Updater saves now install the destination atomically through a same-directory
   temporary file.
+- 1900 date system leap-day gap: Excel counts a fictitious 1900-02-29, so
+  serials 1-59 denote 1900-01-01..1900-02-28. `oaDateToTime()` /
+  `timeToOaDate()` in `writerHelpers.ts` apply the one-day shift (both
+  directions, all readers/writers/updaters incl. browser builds); the 1904
+  system is unaffected. Previously serial 1 read as 1899-12-31, disagreeing
+  with Excel, xlspy and openpyxl.
+- `XlsbUpdater` date fallback now recognises custom `BrtFmt` date formats
+  (e.g. xlspy's `yyyy-mm-dd`) via `BiffReaderWriter.readStyles()` instead of
+  only built-in numFmt ranges, so replacement `Date` cells keep a date style
+  instead of degrading to raw serials.
 
 ## [2.1.0] - 2026-08-07
 

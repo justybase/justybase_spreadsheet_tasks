@@ -22,6 +22,7 @@ function appendAndWait(
     archive: archiver.Archiver,
     source: NodeJS.ReadableStream,
     name: string,
+    output?: fs.WriteStream,
 ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
         const cleanup = (): void => {
@@ -30,6 +31,9 @@ function appendAndWait(
             const maybeEmitter = source as NodeJS.EventEmitter;
             if (typeof maybeEmitter.off === 'function') {
                 maybeEmitter.off('error', onError);
+            }
+            if (output) {
+                output.off('error', onError);
             }
         };
         const onEntry = (): void => {
@@ -42,6 +46,9 @@ function appendAndWait(
         };
         archive.once('entry', onEntry);
         archive.once('error', onError);
+        if (output) {
+            output.once('error', onError);
+        }
         const maybeEmitter = source as NodeJS.EventEmitter;
         if (typeof maybeEmitter.once === 'function') {
             maybeEmitter.once('error', onError);
@@ -80,22 +87,35 @@ export async function writeAdmZipStreaming(
             temporaryPath,
             destinationMode !== undefined ? { mode: destinationMode } : {},
         );
+        // Capture output errors before the append loop (A.3): a failing
+        // destination must reject, abort the archive and remove the temp file.
+        let outputError: Error | null = null;
+        output.on('error', (err: Error) => {
+            outputError = err;
+            try { archive?.abort(); } catch { /* preserve */ }
+        });
         archive = archiver('zip');
+        archive.on('error', (err: Error) => {
+            outputError = err;
+        });
         archive.pipe(output);
 
         for (const entry of zip.getEntries()) {
+            if (outputError) throw outputError;
             const stagedPath = stagedParts.get(entry.entryName);
             if (stagedPath) {
-                await appendAndWait(archive, fs.createReadStream(stagedPath), entry.entryName);
+                await appendAndWait(archive, fs.createReadStream(stagedPath), entry.entryName, output);
             } else {
                 // Decompress each member only after the previous one has been
                 // consumed so a single buffer is retained at a time.
-                await appendAndWait(archive, Readable.from([entry.getData()]), entry.entryName);
+                await appendAndWait(archive, Readable.from([entry.getData()]), entry.entryName, output);
             }
         }
+        if (outputError) throw outputError;
 
         await archive.finalize();
         await finished(output);
+        if (outputError) throw outputError;
 
         if (destinationMode !== undefined) {
             try {

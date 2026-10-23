@@ -6,11 +6,79 @@
  */
 import { BrowserBigBuffer } from './BrowserBigBuffer';
 import { BrowserZip } from './BrowserZip';
-import { isFormattedCell, unwrapCell, getFormat } from '../Formats';
+import { CellValue, isFormattedCell, unwrapCell, getFormat } from '../Formats';
+import {
+    assertCellTextLength,
+    assertColumnCount,
+    assertRowFitsColumns,
+    assertRowCount,
+    timeToOaDate,
+} from '../writerHelpers';
 
 const INVALID_SHEET_NAME_CHARS = /[\\/*?[\]:]/g;
 
+type BrowserHeaderStyle = 'bold' | 'fill' | 'bold+fill';
+
+interface BrowserSheetOptions {
+    doAutofilter?: boolean;
+    headerStyle?: BrowserHeaderStyle;
+}
+
+interface BrowserStartSheetOptions extends BrowserSheetOptions {
+    hidden?: boolean;
+}
+
+interface BrowserFilterData {
+    startRow: number;
+    endRow: number;
+    startColumn: number;
+    endColumn: number;
+}
+
+interface BrowserSheetEntry {
+    name: string;
+    pathInArchive: string;
+    hidden: boolean;
+    nameInArchive: string;
+    sheetId: number;
+    filterHeaderRange: null;
+    filterData?: BrowserFilterData;
+}
+
 export class BrowserXlsbWriter {
+    private _zip: BrowserZip;
+    private _sheetCount: number;
+    private _sheetList: BrowserSheetEntry[];
+    private _sstDic: Map<string, number>;
+    private _sstCntUnique: number;
+    private _sstCntAll: number;
+    private _colWidths: number[];
+    private _autofilterIsOn: boolean;
+    private _oaEpoch: number;
+    private _isStreaming: boolean;
+    private _currentSheetBuffer: BrowserBigBuffer | null;
+    private _currentSheetRowNum: number;
+    private _currentSheetStartCol: number;
+    private _currentSheetEndCol: number;
+    private _currentSheetDoAutofilter: boolean;
+    private _fmtMap: Map<string, { nid: number; xf: number }>;
+    private _nextNid: number;
+    private _nextXf: number;
+    private _sheet1Bytes: Uint8Array<ArrayBuffer>;
+    private _workbookBinStart: Uint8Array<ArrayBuffer>;
+    private _workbookBinMiddle: Uint8Array<ArrayBuffer>;
+    private _workbookBinEnd: Uint8Array<ArrayBuffer>;
+    private _stylesBin: Uint8Array<ArrayBuffer>;
+    private _binaryIndexBin: Uint8Array<ArrayBuffer>;
+    private _rRkIntegerLowerLimit: number;
+    private _rRkIntegerUpperLimit: number;
+    private _autoFilterStartBytes: Uint8Array<ArrayBuffer>;
+    private _autoFilterEndBytes: Uint8Array<ArrayBuffer>;
+    private _stickHeaderA1bytes: Uint8Array<ArrayBuffer>;
+    private _magicFilterExcel2016Fix0: Uint8Array<ArrayBuffer>;
+    private _magicFilterExcel2016Fix1: Uint8Array<ArrayBuffer>;
+    private _magicFilterExcel2016Fix2: Uint8Array<ArrayBuffer>;
+
     constructor() {
         this._zip = new BrowserZip();
         this._sheetCount = 0;
@@ -195,7 +263,7 @@ export class BrowserXlsbWriter {
         this._magicFilterExcel2016Fix2 = new Uint8Array([0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
-    _sanitizeSheetName(name) {
+    _sanitizeSheetName(name: string): string {
         if (!name || typeof name !== 'string') return `Sheet${this._sheetCount + 1}`;
         let s = name.replace(INVALID_SHEET_NAME_CHARS, '_');
         if (s.length > 31) s = s.substring(0, 31);
@@ -203,15 +271,16 @@ export class BrowserXlsbWriter {
         return s;
     }
 
-    _registerFormat(fmtString) {
-        if (this._fmtMap.has(fmtString)) return this._fmtMap.get(fmtString).xf;
+    _registerFormat(fmtString: string): number {
+        const existing = this._fmtMap.get(fmtString);
+        if (existing !== undefined) return existing.xf;
         const nid = this._nextNid++;
         const xf = this._nextXf++;
         this._fmtMap.set(fmtString, { nid, xf });
         return xf;
     }
 
-    _buildStylesBin() {
+    _buildStylesBin(): Uint8Array<ArrayBuffer> {
         if (this._fmtMap.size === 0) return this._stylesBin;
         const base = this._stylesBin;
 
@@ -234,11 +303,11 @@ export class BrowserXlsbWriter {
 
         const tf = 2 + this._fmtMap.size;
         const tx = 4 + this._fmtMap.size;
-        const p = [];
+        const p: Uint8Array<ArrayBuffer>[] = [];
 
-        function vlq(v) { const r = []; while (v >= 128) { r.push((v & 127) | 128); v >>>= 7; } r.push(v & 127); return r; }
-        function brt(t, d) { return new Uint8Array([...vlq(t), ...vlq(d.length), ...d]); }
-        function stFmt(ifmt, fs) {
+        function vlq(v: number): number[] { const r = []; while (v >= 128) { r.push((v & 127) | 128); v >>>= 7; } r.push(v & 127); return r; }
+        function brt(t: number, d: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> { return new Uint8Array([...vlq(t), ...vlq(d.length), ...d]); }
+        function stFmt(ifmt: number, fs: string): Uint8Array<ArrayBuffer> {
             const cch = fs.length, rem = 2 + 4 + cch * 2;
             const buf = new Uint8Array(2 + rem);
             buf[0] = 0x2C; buf[1] = rem;
@@ -247,7 +316,7 @@ export class BrowserXlsbWriter {
             for (let i = 0; i < cch; i++) { const cp = fs.charCodeAt(i); buf[8 + i * 2] = cp & 0xFF; buf[8 + i * 2 + 1] = (cp >> 8) & 0xFF; }
             return buf;
         }
-        function xfRec(fid, ifmt, fl, be = 0) {
+        function xfRec(fid: number, ifmt: number, fl: number, be = 0): Uint8Array<ArrayBuffer> {
             const buf = new Uint8Array(18);
             const dv = new DataView(buf.buffer);
             buf[0] = 0x2F; buf[1] = 16;
@@ -282,7 +351,7 @@ export class BrowserXlsbWriter {
         return r;
     }
 
-    addSheet(sheetName, hidden = false) {
+    addSheet(sheetName: string, hidden = false): void {
         const s = this._sanitizeSheetName(sheetName);
         this._sheetCount++;
         this._sheetList.push({
@@ -295,8 +364,13 @@ export class BrowserXlsbWriter {
         });
     }
 
-    startSheet(sheetName, columnCount, headers, options = {}) {
+    startSheet(sheetName: string, columnCount: number, headers?: string[], options: BrowserStartSheetOptions = {}): void {
         if (this._isStreaming) throw new Error('Already streaming');
+        assertColumnCount(columnCount);
+        if (headers !== undefined) {
+            assertRowFitsColumns('header', headers.length, columnCount);
+            for (const h of headers) assertCellTextLength(h);
+        }
         const { hidden = false, doAutofilter = true, headerStyle = 'bold' } = options;
         let hs = 3; if (headerStyle === 'fill') hs = 4; else if (headerStyle === 'bold+fill') hs = 5;
         this.addSheet(sheetName, hidden);
@@ -325,17 +399,21 @@ export class BrowserXlsbWriter {
         }
     }
 
-    writeRow(row) {
-        if (!this._isStreaming) throw new Error('Not streaming');
+    writeRow(row: CellValue[]): void {
         const bb = this._currentSheetBuffer;
+        if (!this._isStreaming || bb === null) throw new Error('Not streaming');
+        if (row.length !== (this._currentSheetEndCol - this._currentSheetStartCol)) {
+            throw new Error(`Row length mismatch. Expected ${this._currentSheetEndCol - this._currentSheetStartCol} columns, got ${row.length}`);
+        }
+        assertRowCount(this._currentSheetRowNum + 1);
         this.createRowHeader(bb, this._currentSheetRowNum, this._currentSheetStartCol, this._currentSheetEndCol);
         for (let c = 0; c < row.length; c++) this._writeCell(bb, row[c], c);
         this._currentSheetRowNum++;
     }
 
-    endSheet() {
-        if (!this._isStreaming) throw new Error('Not streaming');
+    endSheet(): void {
         const bb = this._currentSheetBuffer;
+        if (!this._isStreaming || bb === null) throw new Error('Not streaming');
         bb.write(this._sheet1Bytes.subarray(218, 290));
         
         if (this._currentSheetDoAutofilter) {
@@ -365,12 +443,20 @@ export class BrowserXlsbWriter {
         this._currentSheetBuffer = null;
     }
 
-    writeSheet(rows, headers = null, options = {}) {
+    writeSheet(rows: CellValue[][], headers: string[] | null = null, options: BrowserSheetOptions = {}): void {
         const doAutofilter = options.doAutofilter !== false;
         const headerStyle = options.headerStyle || 'bold';
         let hs = 3; if (headerStyle === 'fill') hs = 4; else if (headerStyle === 'bold+fill') hs = 5;
         const bb = new BrowserBigBuffer();
         const colCount = rows.length > 0 ? rows[0].length : (headers ? headers.length : 0);
+        if (colCount > 0) assertColumnCount(colCount);
+        const totalBr = rows.length + (headers ? 1 : 0);
+        assertRowCount(totalBr);
+        if (headers) {
+            assertRowFitsColumns('header', headers.length, colCount);
+            for (const h of headers) assertCellTextLength(h);
+        }
+        for (let r = 0; r < rows.length; r++) assertRowFitsColumns('row', rows[r].length, colCount);
         this._colWidths = new Array(colCount).fill(-1.0);
         
         if (headers) {
@@ -385,6 +471,7 @@ export class BrowserXlsbWriter {
             for (let c = 0; c < rows[r].length; c++) {
                 const raw = rows[r][c]; if (raw == null) continue;
                 const v = isFormattedCell(raw) ? raw.value : raw;
+                if (v === null || v === undefined) continue;
                 const len = (v instanceof Date) ? 10 : v.toString().length;
                 let w = 1.3 * len + 3;
                 if (w > 80) w = 80;
@@ -427,7 +514,7 @@ export class BrowserXlsbWriter {
         this._zip.addFile(this._sheetList[this._sheetCount - 1].pathInArchive, bb.toUint8Array());
     }
 
-    _writeSheetHeader(bb, startCol, endCol, doAf) {
+    _writeSheetHeader(bb: BrowserBigBuffer, startCol: number, endCol: number, doAf: boolean): void {
         const sh = new Uint8Array(this._sheet1Bytes);
         const shView = new DataView(sh.buffer);
         shView.setInt32(40, startCol, true);
@@ -452,10 +539,10 @@ export class BrowserXlsbWriter {
         bb.write(new Uint8Array([38, 0]));
     }
 
-    _writeCell(bb, raw, c) {
+    _writeCell(bb: BrowserBigBuffer, raw: CellValue, c: number): void {
         if (raw === null || raw === undefined) return;
         const fmtString = getFormat(raw);
-        const val = fmtString !== null ? unwrapCell(raw) : raw;
+        const val = unwrapCell(raw);
         const styleNum = fmtString !== null ? this._registerFormat(fmtString) : 0;
 
         if (typeof val === 'number') {
@@ -469,14 +556,14 @@ export class BrowserXlsbWriter {
         } else if (typeof val === 'boolean') {
             this.writeBool(bb, val, c);
         } else if (val instanceof Date) {
-            const oaDate = (val.getTime() - this._oaEpoch) / 86400000;
+            const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
             this.writeDouble(bb, oaDate, c, fmtString !== null ? styleNum : 1);
-        } else {
+        } else if (val !== null && val !== undefined) {
             this.writeString(bb, val.toString(), c, 0, fmtString !== null ? styleNum : undefined);
         }
     }
 
-    createRowHeader(bb, rn, sc, ec) {
+    createRowHeader(bb: BrowserBigBuffer, rn: number, sc: number, ec: number): void {
         bb.ensureCapacity(27);
         bb.writeUnsafeByte(0); bb.writeUnsafeByte(25);
         bb.writeUnsafeInt32LE(rn); bb.writeUnsafeInt32LE(0);
@@ -484,31 +571,30 @@ export class BrowserXlsbWriter {
         bb.writeUnsafeByte(0); bb.writeUnsafeByte(1); bb.writeUnsafeByte(0); bb.writeUnsafeByte(0); bb.writeUnsafeByte(0);
         bb.writeUnsafeInt32LE(sc); bb.writeUnsafeInt32LE(ec);
     }
-    writeRkNumberInteger(bb, val, colNum, styleNum = 0) {
+    writeRkNumberInteger(bb: BrowserBigBuffer, val: number, colNum: number, styleNum = 0): void {
         bb.ensureCapacity(14);
         bb.writeUnsafeByte(2); bb.writeUnsafeByte(12);
         bb.writeUnsafeInt32LE(colNum); bb.writeUnsafeByte(styleNum); bb.writeUnsafeByte(0); bb.writeUnsafeByte(0); bb.writeUnsafeByte(0);
         bb.writeUnsafeInt32LE((val << 2) | 2);
     }
-    writeDouble(bb, val, colNum, styleNum = 0) {
+    writeDouble(bb: BrowserBigBuffer, val: number, colNum: number, styleNum = 0): void {
         bb.ensureCapacity(18);
         bb.writeUnsafeByte(5); bb.writeUnsafeByte(16);
         bb.writeUnsafeInt32LE(colNum); bb.writeUnsafeByte(styleNum); bb.writeUnsafeByte(0); bb.writeUnsafeByte(0); bb.writeUnsafeByte(0);
         bb.writeUnsafeDoubleLE(val);
     }
-    writeBool(bb, val, colNum) {
+    writeBool(bb: BrowserBigBuffer, val: boolean, colNum: number): void {
         bb.ensureCapacity(13);
         bb.writeUnsafeByte(0x04); bb.writeUnsafeByte(9);
         bb.writeUnsafeInt32LE(colNum); bb.writeUnsafeInt32LE(0); bb.writeUnsafeByte(val ? 1 : 0);
     }
-    writeDateTime(bb, date, colNum) {
-        this.writeDouble(bb, (date.getTime() - this._oaEpoch) / 86400000, colNum, 1);
+    writeDateTime(bb: BrowserBigBuffer, date: Date, colNum: number): void {
+        this.writeDouble(bb, timeToOaDate(date.getTime(), this._oaEpoch), colNum, 1);
     }
-    writeString(bb, val, colNum, styleIndex = 0, styleOverride = undefined) {
-        let index;
-        if (this._sstDic.has(val)) {
-            index = this._sstDic.get(val);
-        } else {
+    writeString(bb: BrowserBigBuffer, val: string, colNum: number, styleIndex = 0, styleOverride?: number): void {
+        assertCellTextLength(val);
+        let index = this._sstDic.get(val);
+        if (index === undefined) {
             index = this._sstCntUnique++;
             this._sstDic.set(val, index);
         }
@@ -521,10 +607,10 @@ export class BrowserXlsbWriter {
         bb.writeUnsafeInt32LE(index);
     }
 
-    _saveSst() {
+    _saveSst(): void {
         const bb = new BrowserBigBuffer();
         bb.writeByte(159); bb.writeByte(1); bb.writeByte(8);
-        bb.writeInt32LE(this._sstCntUnique); bb.writeInt32LE(this._sstCntAll);
+        bb.writeInt32LE(this._sstCntAll); bb.writeInt32LE(this._sstCntUnique);
         
         for (const [txt] of this._sstDic) {
             const tl = txt.length;
@@ -545,7 +631,7 @@ export class BrowserXlsbWriter {
         this._zip.addFile('xl/sharedStrings.bin', bb.toUint8Array());
     }
 
-    _writeFilterDefinedName(wbBuffers, sheet, sheetNum) {
+    _writeFilterDefinedName(wbBuffers: Uint8Array<ArrayBuffer>[], sheet: BrowserSheetEntry & { filterData: BrowserFilterData }, sheetNum: number): void {
         const fd = sheet.filterData;
         const fix1 = new Uint8Array(this._magicFilterExcel2016Fix1);
         fix1[7] = sheet.sheetId - 1;
@@ -559,7 +645,7 @@ export class BrowserXlsbWriter {
         wbBuffers.push(this._magicFilterExcel2016Fix2);
     }
 
-    finalize() {
+    finalize(): Blob {
         this._saveSst();
         this._zip.addFile('xl/styles.bin', this._buildStylesBin());
         
@@ -584,7 +670,7 @@ export class BrowserXlsbWriter {
         wbBuffers.push(this._workbookBinMiddle);
         
         if (this._autofilterIsOn) {
-            const filtered = this._sheetList.filter(s => s.filterData);
+            const filtered = this._sheetList.filter((s): s is BrowserSheetEntry & { filterData: BrowserFilterData } => s.filterData !== undefined);
             if (filtered.length > 0) {
                 wbBuffers.push(this._magicFilterExcel2016Fix0);
                 const cnt = filtered.length;

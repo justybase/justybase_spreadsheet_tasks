@@ -1,14 +1,8 @@
-/**
- * BrowserZip - Minimal ZIP archive builder for browser environments.
- * Creates uncompressed ZIP files (STORE method) without any external dependencies.
- * Sufficient for Excel files since the data inside is already structured efficiently.
- * For smaller output, the generated blob can be further compressed using CompressionStream API.
- * 
- * @module BrowserZip
- */
 export class BrowserZip {
+    files: { name: string; data: Uint8Array<ArrayBuffer> }[] = [];
+    private static _crc32Table: Uint32Array | null = null;
+
     constructor() {
-        /** @type {{ name: string, data: Uint8Array }[]} */
         this.files = [];
     }
 
@@ -17,8 +11,8 @@ export class BrowserZip {
      * @param {string} name - Path inside the ZIP (e.g. "xl/workbook.xml")
      * @param {string | Uint8Array | Uint8Array[]} data - File contents
      */
-    addFile(name, data) {
-        let bytes;
+    addFile(name: string, data: string | Uint8Array<ArrayBuffer> | Uint8Array<ArrayBuffer>[]): void {
+        let bytes: Uint8Array<ArrayBuffer>;
         if (typeof data === 'string') {
             bytes = new TextEncoder().encode(data);
         } else if (Array.isArray(data)) {
@@ -41,9 +35,9 @@ export class BrowserZip {
      * Generate the ZIP file as a Blob.
      * @returns {Blob}
      */
-    toBlob() {
-        const parts = [];
-        const centralDir = [];
+    toBlob(): Blob {
+        const parts: (Uint8Array<ArrayBuffer> | Blob)[] = [];
+        const centralDir: Uint8Array<ArrayBuffer>[] = [];
         let localOffset = 0;
 
         for (const file of this.files) {
@@ -128,7 +122,7 @@ export class BrowserZip {
      * @param {Uint8Array} data
      * @returns {number}
      */
-    _crc32(data) {
+    _crc32(data: Uint8Array): number {
         if (!BrowserZip._crc32Table) {
             BrowserZip._crc32Table = new Uint32Array(256);
             for (let i = 0; i < 256; i++) {
@@ -150,6 +144,5 @@ export class BrowserZip {
 }
 
 /** @type {Uint32Array | null} */
-BrowserZip._crc32Table = null;
 
 export default BrowserZip;

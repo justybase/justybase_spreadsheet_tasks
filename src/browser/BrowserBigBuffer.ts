@@ -1,13 +1,14 @@
-/**
- * BrowserBigBuffer - Browser-compatible replacement for BigBuffer.
- * Uses Uint8Array + DataView instead of Node.js Buffer.
- * @module BrowserBigBuffer
- */
 export class BrowserBigBuffer {
+    chunkSize: number;
+    chunks: Uint8Array<ArrayBuffer>[];
+    currentBuffer: Uint8Array<ArrayBuffer>;
+    dataView: DataView;
+    cursor: number;
+    private _textEncoder: InstanceType<typeof TextEncoder>;
     /**
      * @param {number} [chunkSize=65536]
      */
-    constructor(chunkSize = 65536) {
+    constructor(chunkSize: number = 65536) {
         this.chunkSize = chunkSize;
         /** @type {Uint8Array[]} */
         this.chunks = [];
@@ -20,7 +21,7 @@ export class BrowserBigBuffer {
     /**
      * @param {number} size
      */
-    ensureCapacity(size) {
+    ensureCapacity(size: number) {
         if (this.cursor + size > this.chunkSize) {
             this._flush();
         }
@@ -39,7 +40,7 @@ export class BrowserBigBuffer {
      * Write a Uint8Array to the buffer.
      * @param {Uint8Array} buffer
      */
-    write(buffer) {
+    write(buffer: Uint8Array) {
         let len = buffer.length;
         let offset = 0;
 
@@ -62,7 +63,7 @@ export class BrowserBigBuffer {
     /**
      * @param {number} val
      */
-    writeByte(val) {
+    writeByte(val: number) {
         this.ensureCapacity(1);
         this.currentBuffer[this.cursor] = val;
         this.cursor++;
@@ -71,14 +72,14 @@ export class BrowserBigBuffer {
     /**
      * @param {number} val
      */
-    writeUnsafeByte(val) {
+    writeUnsafeByte(val: number) {
         this.currentBuffer[this.cursor++] = val;
     }
 
     /**
      * @param {number} val
      */
-    writeInt32LE(val) {
+    writeInt32LE(val: number) {
         this.ensureCapacity(4);
         this.dataView.setInt32(this.cursor, val, true);
         this.cursor += 4;
@@ -87,7 +88,7 @@ export class BrowserBigBuffer {
     /**
      * @param {number} val
      */
-    writeUnsafeInt32LE(val) {
+    writeUnsafeInt32LE(val: number) {
         this.dataView.setInt32(this.cursor, val, true);
         this.cursor += 4;
     }
@@ -95,7 +96,7 @@ export class BrowserBigBuffer {
     /**
      * @param {number} val
      */
-    writeDoubleLE(val) {
+    writeDoubleLE(val: number) {
         this.ensureCapacity(8);
         this.dataView.setFloat64(this.cursor, val, true);
         this.cursor += 8;
@@ -104,7 +105,7 @@ export class BrowserBigBuffer {
     /**
      * @param {number} val
      */
-    writeUnsafeDoubleLE(val) {
+    writeUnsafeDoubleLE(val: number) {
         this.dataView.setFloat64(this.cursor, val, true);
         this.cursor += 8;
     }
@@ -113,7 +114,7 @@ export class BrowserBigBuffer {
      * Write a UTF-8 string.
      * @param {string} str
      */
-    writeString(str) {
+    writeString(str: string) {
         const encoded = this._textEncoder.encode(str);
         const byteLength = encoded.length;
 
@@ -137,7 +138,7 @@ export class BrowserBigBuffer {
      * Write a string as UTF-16LE.
      * @param {string} str
      */
-    writeUtf16LE(str) {
+    writeUtf16LE(str: string) {
         const byteLength = str.length * 2;
 
         if (this.cursor + byteLength <= this.chunkSize) {
@@ -171,7 +172,7 @@ export class BrowserBigBuffer {
      * Flush and return all chunks.
      * @returns {Uint8Array[]}
      */
-    getChunks() {
+    getChunks(): Uint8Array<ArrayBuffer>[] {
         if (this.cursor > 0) {
             this.chunks.push(this.currentBuffer.slice(0, this.cursor));
             this.currentBuffer = new Uint8Array(this.chunkSize);
@@ -185,7 +186,7 @@ export class BrowserBigBuffer {
      * Concatenate all chunks into a single Uint8Array.
      * @returns {Uint8Array}
      */
-    toUint8Array() {
+    toUint8Array(): Uint8Array<ArrayBuffer> {
         const chunks = this.getChunks();
         let totalLen = 0;
         for (const c of chunks) totalLen += c.length;

@@ -5,12 +5,16 @@ import AdmZip from 'adm-zip';
 import { CellValue, getFormat, unwrapCell } from './Formats';
 import { writeBufferAtomically } from './atomicFile';
 import { writeAdmZipStreaming, StagedZipPart } from './streamingZip';
+import { timeToOaDate } from './writerHelpers';
 import {
     escapeXmlText,
     columnIndexToLetter,
     columnLetterToIndex,
     parseSharedStringsXml,
     trimTrailingEmptyRows,
+    parseTagAttributes,
+    resolveRelTarget,
+    unescapeXml,
 } from './xmlUtils';
 
 /**
@@ -40,6 +44,32 @@ export type RowSource =
 interface PivotCacheDef {
     path: string;
     xml: string;
+}
+
+interface CellRange {
+    c1: number;
+    r1: number;
+    c2: number;
+    r2: number;
+}
+
+/** Parse an A1-style range ("A1", "A1:B10", "$A$1:$B$10"). */
+function parseCellRange(ref: string): CellRange | null {
+    const m = /^\$?([A-Za-z]+)\$?(\d+)(?::\$?([A-Za-z]+)\$?(\d+))?$/.exec(ref.trim());
+    if (!m) return null;
+    const c1 = columnLetterToIndex(m[1].toUpperCase());
+    const r1 = parseInt(m[2], 10);
+    const c2 = m[3] ? columnLetterToIndex(m[3].toUpperCase()) : c1;
+    const r2 = m[4] ? parseInt(m[4], 10) : r1;
+    if (!Number.isFinite(c1) || !Number.isFinite(r1) || !Number.isFinite(c2) || !Number.isFinite(r2)) {
+        return null;
+    }
+    return {
+        c1: Math.min(c1, c2),
+        r1: Math.min(r1, r2),
+        c2: Math.max(c1, c2),
+        r2: Math.max(r1, r2),
+    };
 }
 
 /**
@@ -73,7 +103,7 @@ export class XlsxUpdater {
     private sharedStringsDirty: boolean = false;
     private stringIndexMap: Map<string, number> = new Map();
 
-    private readonly _oaEpoch: number;
+    private _oaEpoch: number;
 
     /**
      * @param path Path to an existing `.xlsx` file.
@@ -169,6 +199,8 @@ export class XlsxUpdater {
             : 'A1';
         this._updatePivotCaches(sheetName, dimRef, rows.length);
         this._addRefreshOnLoadToPivotTables();
+        this._removeCalcChain();
+        this._updateTableRefs(sheetName, dimRef);
     }
 
     /**
@@ -323,6 +355,8 @@ export class XlsxUpdater {
             this._commitSharedStrings();
             this._updatePivotCaches(sheetName, dimRef, keptDataRows);
             this._addRefreshOnLoadToPivotTables();
+            this._removeCalcChain();
+            this._updateTableRefs(sheetName, dimRef);
 
             if (oldStage && oldStage !== outputPath) {
                 this._removeTemporaryFile(oldStage);
@@ -468,10 +502,15 @@ export class XlsxUpdater {
         const rIdToTarget: Record<string, string> = {};
         if (relsEntry) {
             const rels = relsEntry.getData().toString('utf8');
-            const relRegex = /<Relationship[^>]*Id="([^"]*)"[^>]*Target="([^"]*)"/g;
-            let match;
-            while ((match = relRegex.exec(rels)) !== null) {
-                rIdToTarget[match[1]] = match[2];
+            const relTagRe = /<Relationship\b[^>]*>/g;
+            let tagMatch;
+            while ((tagMatch = relTagRe.exec(rels)) !== null) {
+                const attrs = parseTagAttributes(tagMatch[0]);
+                const id = attrs['Id'] ?? attrs['id'];
+                const target = attrs['Target'] ?? attrs['target'];
+                if (id !== undefined && target !== undefined) {
+                    rIdToTarget[id] = target;
+                }
             }
         }
 
@@ -481,25 +520,24 @@ export class XlsxUpdater {
         let match;
         while ((match = sheetRe.exec(wbXml)) !== null) {
             const tag = match[0];
-            const nameMatch = /name="([^"]*)"/.exec(tag);
-            const rIdMatch = /r:id="([^"]*)"/.exec(tag);
-            if (!nameMatch || !rIdMatch) continue;
-            const name = nameMatch[1]
-                .replace(/&amp;/g, '&')
-                .replace(/&lt;/g, '<')
-                .replace(/&gt;/g, '>')
-                .replace(/&quot;/g, '"')
-                .replace(/&apos;/g, "'");
-            const target = rIdToTarget[rIdMatch[1]] ?? '';
-            let fullPath = target;
-            if (fullPath.startsWith('/')) {
-                fullPath = fullPath.substring(1);
-            } else if (!fullPath.startsWith('xl/')) {
-                fullPath = 'xl/' + fullPath;
-            }
+            const attrs = parseTagAttributes(tag);
+            const rawName = attrs['name'];
+            const rId = attrs['r:id'] ?? attrs['id'] ?? attrs['rId'];
+            if (rawName === undefined || rId === undefined) continue;
+            const name = unescapeXml(rawName);
+            const target = rIdToTarget[rId] ?? '';
+            const fullPath = resolveRelTarget(target);
             if (fullPath) {
                 this.sheetNameToPath.set(name, fullPath);
             }
+        }
+        // 1904 date system for Date→OA conversion.
+        const wbPrMatch = /<workbookPr\b[^>]*>/i.exec(wbXml);
+        if (wbPrMatch) {
+            const wbPrAttrs = parseTagAttributes(wbPrMatch[0]);
+            const v = (wbPrAttrs['date1904'] ?? '').trim().toLowerCase();
+            this._oaEpoch =
+                (v === '1' || v === 'true') ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
         }
 
         for (const entry of this.zip.getEntries()) {
@@ -736,7 +774,7 @@ export class XlsxUpdater {
             return `<c r="${colRef}${rowNum}" t="b"${colStyle > 0 ? ` s="${colStyle}"` : ''}><v>${val ? 1 : 0}</v></c>`;
         }
         if (val instanceof Date) {
-            const oaDate = (val.getTime() - this._oaEpoch) / 86400000;
+            const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
             if (Number.isFinite(oaDate)) {
                 const style = colStyle > 0 ? colStyle : (dateStyle !== null ? dateStyle : 0);
                 return `<c r="${colRef}${rowNum}"${style > 0 ? ` s="${style}"` : ''}><v>${oaDate}</v></c>`;
@@ -1013,6 +1051,275 @@ export class XlsxUpdater {
             const newTag = rootMatch[0].replace(/(\/?>)$/, ' refreshOnLoad="1"$1');
             xml = xml.substring(0, rootMatch.index) + newTag + xml.substring(rootMatch.index + rootMatch[0].length);
             this.zip.updateFile(path, Buffer.from(xml, 'utf8'));
+        }
+    }
+
+    /**
+     * Remove the stale calculation chain (xl/calcChain.xml). Excel rebuilds it
+     * on open; keeping stale <c> entries for the replaced sheet would force a
+     * repair prompt. Removes the part, its Content_Types override and its
+     * workbook rels entry (xlspy parity).
+     */
+    private _removeCalcChain(): void {
+        const calcPath = 'xl/calcChain.xml';
+        if (!this.zip.getEntry(calcPath) && !this.stagedParts.has(calcPath)) {
+            this._ensureCalcPrFullCalc();
+            return;
+        }
+        try {
+            this.zip.deleteFile(calcPath);
+        } catch {
+            // Best-effort; continue with rels/content-type cleanup.
+        }
+        const stagedCalc = this.stagedParts.get(calcPath);
+        if (stagedCalc) {
+            this.stagedParts.delete(calcPath);
+            try {
+                fs.rmSync(stagedCalc, { force: true });
+            } catch {
+                // Best-effort.
+            }
+        }
+
+        const ctEntry = this.zip.getEntry('[Content_Types].xml');
+        if (ctEntry || this.stagedParts.has('[Content_Types].xml')) {
+            try {
+                let ct = this._entryData('[Content_Types].xml').toString('utf8');
+                const before = ct;
+                ct = ct.replace(/<Override\b[^>]*PartName="\/xl\/calcChain\.xml"[^>]*\/?>/gi, '');
+                if (ct !== before) {
+                    this._writePartText('[Content_Types].xml', ct);
+                }
+            } catch {
+                // Best-effort.
+            }
+        }
+
+        const relsPath = 'xl/_rels/workbook.xml.rels';
+        if (this.zip.getEntry(relsPath) || this.stagedParts.has(relsPath)) {
+            try {
+                const rels = this._entryData(relsPath).toString('utf8');
+                const relTagRe = /<Relationship\b[^>]*>/g;
+                let m: RegExpExecArray | null;
+                let out = '';
+                let last = 0;
+                let changed = false;
+                while ((m = relTagRe.exec(rels)) !== null) {
+                    const attrs = parseTagAttributes(m[0]);
+                    const type = attrs['Type'] ?? attrs['type'] ?? '';
+                    const target = attrs['Target'] ?? attrs['target'] ?? '';
+                    const isCalcChain = type.endsWith('/calcChain') &&
+                        resolveRelTarget(target) === 'xl/calcChain.xml';
+                    if (isCalcChain) {
+                        out += rels.substring(last, m.index);
+                        last = m.index + m[0].length;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    out += rels.substring(last);
+                    this._writePartText(relsPath, out);
+                }
+            } catch {
+                // Best-effort.
+            }
+        }
+        this._ensureCalcPrFullCalc();
+    }
+
+    private _writePartText(name: string, text: string): void {
+        if (this.stagedParts.has(name)) {
+            fs.writeFileSync(this.stagedParts.get(name)!, text, 'utf8');
+        } else {
+            this.zip.updateFile(name, Buffer.from(text, 'utf8'));
+        }
+    }
+
+    private _ensureCalcPrFullCalc(): void {
+        try {
+            const wbPath = 'xl/workbook.xml';
+            if (!this.zip.getEntry(wbPath) && !this.stagedParts.has(wbPath)) return;
+            let xml = this._entryData(wbPath).toString('utf8');
+            const calcPrRe = /<(?:[A-Za-z_][\w.-]*:)?calcPr\b[^>]*>/i;
+            const match = calcPrRe.exec(xml);
+            if (match && match.index !== undefined) {
+                const newTag = XlsxUpdater._replaceOrAddXmlAttribute(match[0], 'fullCalcOnLoad', '1');
+                // The replacement can change the tag length, so consume the
+                // *original* tag (`match[0]`), not `newTag`.
+                xml = xml.substring(0, match.index) + newTag + xml.substring(match.index + match[0].length);
+            } else {
+                const insertAt = XlsxUpdater._calcPrInsertPosition(xml);
+                if (insertAt < 0) return;
+                xml = xml.substring(0, insertAt) + '<calcPr fullCalcOnLoad="1"/>' + xml.substring(insertAt);
+            }
+            this._writePartText(wbPath, xml);
+        } catch {
+            // Best-effort.
+        }
+    }
+
+    /**
+     * Insertion offset for a missing `<calcPr>`. The element follows
+     * sheets/externalReferences/definedNames in the workbook schema, so insert
+     * after the last of those that exists instead of right after `<workbook>`.
+     */
+    private static _calcPrInsertPosition(xml: string): number {
+        const prefixed = '(?:[A-Za-z_][\\w.-]*:)?';
+        const candidates = [
+            new RegExp(`</${prefixed}sheets\\s*>`, 'i'),
+            new RegExp(`<${prefixed}externalReferences\\b[^>]*/>`, 'i'),
+            new RegExp(`<${prefixed}externalReferences\\b[^>]*>[\\s\\S]*?</${prefixed}externalReferences\\s*>`, 'i'),
+            new RegExp(`<${prefixed}definedNames\\b[^>]*/>`, 'i'),
+            new RegExp(`<${prefixed}definedNames\\b[^>]*>[\\s\\S]*?</${prefixed}definedNames\\s*>`, 'i'),
+        ];
+        let insertAt = -1;
+        for (const re of candidates) {
+            const m = re.exec(xml);
+            if (m && m.index !== undefined) {
+                insertAt = Math.max(insertAt, m.index + m[0].length);
+            }
+        }
+        if (insertAt >= 0) return insertAt;
+        // Fallbacks for unusual workbooks: before the close tag, else after the root.
+        const close = new RegExp(`</${prefixed}workbook\\s*>`, 'i').exec(xml);
+        if (close && close.index !== undefined) return close.index;
+        const root = new RegExp(`<${prefixed}workbook\\b[^>]*>`, 'i').exec(xml);
+        if (!root || root.index === undefined) return -1;
+        return root.index + root[0].length;
+    }
+
+    /**
+     * Update ListObject table ranges (xl/tables/*.xml) for the replaced sheet.
+     * Only tables anchored at A1 are updated to the new dimension; tables
+     * elsewhere are left untouched (moving them would corrupt the sheet).
+     * Empty replacements (dimRef "A1") do not shrink multi-column tables.
+     */
+    private _updateTableRefs(sheetName: string, dimRef: string): void {
+        const sheetPath = this.sheetNameToPath.get(sheetName);
+        if (!sheetPath) return;
+        const slash = sheetPath.lastIndexOf('/');
+        const dir = slash >= 0 ? sheetPath.substring(0, slash + 1) : '';
+        const base = slash >= 0 ? sheetPath.substring(slash + 1) : sheetPath;
+        const sheetRelsPath = `${dir}_rels/${base}.rels`;
+        const sheetRelsEntry = this.zip.getEntry(sheetRelsPath);
+        const hasStagedRels = this.stagedParts.has(sheetRelsPath);
+        if (!sheetRelsEntry && !hasStagedRels) return;
+
+        const tableTargets: string[] = [];
+        try {
+            const relsXml = this._entryData(sheetRelsPath).toString('utf8');
+            const relTagRe = /<Relationship\b[^>]*>/g;
+            let m: RegExpExecArray | null;
+            while ((m = relTagRe.exec(relsXml)) !== null) {
+                const attrs = parseTagAttributes(m[0]);
+                const type = attrs['Type'] ?? attrs['type'] ?? '';
+                const target = attrs['Target'] ?? attrs['target'] ?? '';
+                if (!type.includes('/table') || !target) continue;
+                let tablePath: string;
+                if (target.startsWith('/')) {
+                    tablePath = resolveRelTarget(target);
+                } else {
+                    // Resolve relative to the worksheet directory (e.g. ../tables/table1.xml).
+                    const combined = dir + target;
+                    const parts: string[] = [];
+                    for (const seg of combined.split('/')) {
+                        if (seg === '..') parts.pop();
+                        else if (seg !== '.' && seg !== '') parts.push(seg);
+                    }
+                    tablePath = parts.join('/');
+                }
+                tableTargets.push(tablePath);
+            }
+        } catch {
+            return;
+        }
+        if (tableTargets.length === 0) return;
+
+        // Read every table first: expanding an A1 table must not overlap a table
+        // that sits below it in the same columns.
+        const tables: Array<{
+            path: string;
+            xml: string;
+            tag: string;
+            tagIndex: number;
+            ref: string;
+            range: CellRange | null;
+            staged: boolean;
+        }> = [];
+        for (const tablePath of tableTargets) {
+            try {
+                const hasEntry = !!this.zip.getEntry(tablePath);
+                const hasStaged = this.stagedParts.has(tablePath);
+                if (!hasEntry && !hasStaged) continue;
+                const xml = this._entryData(tablePath).toString('utf8');
+                const tableTagRe = /<(?:[A-Za-z_][\w.-]*:)?table\b[^>]*>/i;
+                const tableMatch = tableTagRe.exec(xml);
+                if (!tableMatch || tableMatch.index === undefined) continue;
+                const refMatch = /\bref\s*=\s*("([^"]*)"|'([^']*)')/i.exec(tableMatch[0]);
+                const ref = refMatch ? (refMatch[2] ?? refMatch[3] ?? '') : '';
+                tables.push({
+                    path: tablePath,
+                    xml,
+                    tag: tableMatch[0],
+                    tagIndex: tableMatch.index,
+                    ref,
+                    range: parseCellRange(ref),
+                    staged: hasStaged,
+                });
+            } catch {
+                // Best-effort per table.
+            }
+        }
+        if (tables.length === 0) return;
+
+        const dimRange = parseCellRange(dimRef);
+        if (!dimRange) return;
+
+        for (const table of tables) {
+            try {
+                const origRange = table.range;
+                if (!origRange) continue;
+                // Only A1-anchored tables track the sheet data range.
+                if (origRange.r1 !== 1 || origRange.c1 !== 0) continue;
+                // Don't collapse a multi-column table to a single cell.
+                if (dimRef === 'A1' && !/^A1$/i.test(table.ref)) continue;
+                const origCols = origRange.c2 - origRange.c1 + 1;
+                const newCols = dimRange.c2 - dimRange.c1 + 1;
+                // Changing the width would also require rebuilding <tableColumns>.
+                if (newCols !== origCols) continue;
+
+                // Cap at the first other table below this one so tables never overlap.
+                let lastRow = dimRange.r2;
+                for (const other of tables) {
+                    if (other === table || !other.range) continue;
+                    if (other.range.r1 <= 1) continue;
+                    if (other.range.c1 > origRange.c2 || other.range.c2 < origRange.c1) continue;
+                    lastRow = Math.min(lastRow, other.range.r1 - 1);
+                }
+                if (lastRow < 1) continue;
+
+                const newRef = origRange.c2 === 0 && lastRow === 1
+                    ? 'A1'
+                    : `A1:${columnIndexToLetter(origRange.c2)}${lastRow}`;
+                let xml = table.xml;
+                const newTag = XlsxUpdater._replaceOrAddXmlAttribute(table.tag, 'ref', newRef);
+                xml = xml.substring(0, table.tagIndex) + newTag +
+                    xml.substring(table.tagIndex + table.tag.length);
+                const afRe = /<(?:[A-Za-z_][\w.-]*:)?autoFilter\b[^>]*>/i;
+                const afMatch = afRe.exec(xml);
+                if (afMatch && afMatch.index !== undefined) {
+                    const newAf = XlsxUpdater._replaceOrAddXmlAttribute(afMatch[0], 'ref', newRef);
+                    xml = xml.substring(0, afMatch.index) + newAf +
+                        xml.substring(afMatch.index + afMatch[0].length);
+                }
+                if (table.staged) {
+                    fs.writeFileSync(this.stagedParts.get(table.path)!, xml, 'utf8');
+                } else {
+                    this.zip.updateFile(table.path, Buffer.from(xml, 'utf8'));
+                }
+            } catch {
+                // Best-effort per table.
+            }
         }
     }
 }

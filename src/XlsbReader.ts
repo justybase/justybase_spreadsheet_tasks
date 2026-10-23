@@ -2,6 +2,9 @@ import AdmZip from 'adm-zip';
 import { ExcelReaderAbstract } from './ExcelReaderAbstract';
 import { BiffReaderWriter } from './BiffReaderWriter';
 import { CellValue } from './Formats';
+import { parseTagAttributes, resolveRelTarget } from './xmlUtils';
+import { readRecord, Biff12Record } from './biff12Utils';
+import { MAX_ROWS } from './writerHelpers';
 
 interface SheetInfo {
     name: string;
@@ -19,6 +22,7 @@ export class XlsbReader extends ExcelReaderAbstract {
     private _reader: BiffReaderWriter | null = null;
     private _currentRow: CellValue[] = [];
     private _pendingRowIndex: number = -1;
+    private _nextExpectedRow: number = 0;
     private _eof: boolean = false;
 
     xfIdToNumFmtId: number[] = [];
@@ -29,6 +33,23 @@ export class XlsbReader extends ExcelReaderAbstract {
     }
 
     async open(path: string, readSharedStrings: boolean = true): Promise<void> {
+        await this.close();
+        // Reset state for re-open (xlspy parity).
+        this.sheetNames = [];
+        this.sheets = [];
+        this.sharedStrings = [];
+        this.xfIdToNumFmtId = [];
+        this.customDateFormats = new Set();
+        this.fieldCount = 0;
+        this.resultsCount = 0;
+        this.actualSheetName = '';
+        this._currentSheetIndex = -1;
+        this._currentRow = [];
+        this._pendingRowIndex = -1;
+        this._nextExpectedRow = 0;
+        this._eof = false;
+        this._reader = null;
+        this._oaEpoch = Date.UTC(1899, 11, 30);
         this.zip = new AdmZip(path);
 
         const wbEntry = this.zip.getEntry('xl/workbook.bin');
@@ -48,21 +69,43 @@ export class XlsbReader extends ExcelReaderAbstract {
         const relsEntry = this.zip.getEntry('xl/_rels/workbook.bin.rels');
         if (relsEntry) {
             const xml = relsEntry.getData().toString('utf8');
-            const relRegex = /<Relationship[^>]*Id="([^"]*)"[^>]*Target="([^"]*)"/g;
-            let match;
+            const relTagRe = /<Relationship\b[^>]*>/g;
+            let tagMatch;
             const rIdToTarget: Record<string, string> = {};
-            while ((match = relRegex.exec(xml)) !== null) {
-                rIdToTarget[match[1]] = match[2];
+            while ((tagMatch = relTagRe.exec(xml)) !== null) {
+                const attrs = parseTagAttributes(tagMatch[0]);
+                const id = attrs['Id'] ?? attrs['id'];
+                const target = attrs['Target'] ?? attrs['target'];
+                if (id !== undefined && target !== undefined) {
+                    rIdToTarget[id] = target;
+                }
             }
 
             for (const sheet of this.sheets) {
-                let target = rIdToTarget[sheet.rId];
+                const target = rIdToTarget[sheet.rId];
                 if (target) {
-                    if (target.startsWith('/')) target = target.substring(1);
-                    if (!target.startsWith('xl/')) target = 'xl/' + target;
-                    sheet.path = target;
+                    sheet.path = resolveRelTarget(target);
                 }
             }
+        }
+
+        // 1904 date system: BrtWbProp (0x99) bit0 f1904 in workbook.bin.
+        try {
+            const raw = wbEntry ? wbEntry.getData() : null;
+            if (raw) {
+                const rec: Biff12Record = { headerStart: 0, dataStart: 0, dataEnd: 0, id: 0, len: 0 };
+                let pos = 0;
+                while (readRecord(raw, pos, rec)) {
+                    if (rec.id === 0x99 && rec.len >= 4) {
+                        const is1904 = (raw[rec.dataStart] & 0x01) !== 0;
+                        this._oaEpoch = is1904 ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
+                        break;
+                    }
+                    pos = rec.dataEnd;
+                }
+            }
+        } catch {
+            // Keep default epoch on parse errors.
         }
 
         if (readSharedStrings) {
@@ -110,6 +153,33 @@ export class XlsbReader extends ExcelReaderAbstract {
         return this.sheetNames;
     }
 
+    async selectSheet(nameOrIndex: string | number): Promise<void> {
+        let index = -1;
+        if (typeof nameOrIndex === 'number') {
+            index = nameOrIndex;
+        } else {
+            index = this.sheetNames.indexOf(nameOrIndex);
+            if (index === -1) throw new Error(`Sheet '${nameOrIndex}' not found`);
+        }
+        if (index < 0 || index >= this.sheets.length) {
+            throw new Error(`Sheet index ${String(nameOrIndex)} out of range`);
+        }
+        this._currentSheetIndex = index;
+        if (!this._initSheet(index)) {
+            throw new Error(`XlsbReader: worksheet part missing for sheet '${this.sheetNames[index]}'.`);
+        }
+    }
+
+    async nextResult(): Promise<boolean> {
+        const next = this._currentSheetIndex + 1;
+        if (next >= this.sheets.length) return false;
+        this._currentSheetIndex = next;
+        if (!this._initSheet(next)) {
+            throw new Error(`XlsbReader: worksheet part missing for sheet '${this.sheetNames[next]}'.`);
+        }
+        return true;
+    }
+
     async read(): Promise<boolean> {
         if (this._currentSheetIndex === -1) {
             this._currentSheetIndex = 0;
@@ -118,17 +188,33 @@ export class XlsbReader extends ExcelReaderAbstract {
 
         if (this._eof) return false;
 
+        // Gap rows (missing BrtRowHdr) are returned as empty rows. An index beyond
+        // Excel's row limit is malformed: skip the fill instead of yielding millions of rows.
+        if (this._pendingRowIndex > this._nextExpectedRow && this._pendingRowIndex < MAX_ROWS) {
+            this._currentRow = [];
+            this._nextExpectedRow++;
+            return true;
+        }
+
         this._currentRow = [];
 
         while (true) {
             const hasRecord = this._reader!.readWorksheet();
             if (!hasRecord) {
                 this._eof = true;
+                // If the current row never had cells and we never yielded it,
+                // still return it once (handles single empty row sheets).
+                // When _currentRow is empty and pending was already yielded,
+                // the caller already got it via gap logic; avoid duplicate.
+                // Here pending == expected, so this is the last row.
+                this._nextExpectedRow = this._pendingRowIndex + 1;
                 return true;
             }
 
             if (this._reader!._rowIndex !== -1 && this._reader!._rowIndex !== this._pendingRowIndex) {
+                const completed = this._pendingRowIndex;
                 this._pendingRowIndex = this._reader!._rowIndex;
+                this._nextExpectedRow = completed + 1;
                 return true;
             }
 
@@ -178,14 +264,20 @@ export class XlsbReader extends ExcelReaderAbstract {
     }
 
     private _initSheet(index: number): boolean {
-        if (index >= this.sheets.length) return false;
+        if (index < 0 || index >= this.sheets.length) return false;
         const sheet = this.sheets[index];
-        const entry = this.zip!.getEntry(sheet.path!);
+        const entry = sheet.path ? this.zip!.getEntry(sheet.path) : undefined;
+        // Only a missing part is an error; a valid but empty sheet is selected
+        // successfully and reports EOF through read().
         if (!entry) return false;
 
         this._reader = new BiffReaderWriter(entry.getData());
         this._eof = false;
         this._pendingRowIndex = -1;
+        this._nextExpectedRow = 0;
+        this._currentRow = [];
+        this.fieldCount = 0;
+        this.actualSheetName = sheet.name;
 
         while (this._reader.readWorksheet()) {
             if (this._reader._rowIndex !== -1) {
@@ -195,7 +287,7 @@ export class XlsbReader extends ExcelReaderAbstract {
         }
 
         this._eof = true;
-        return false;
+        return true;
     }
 
     getValue(i: number): CellValue {
