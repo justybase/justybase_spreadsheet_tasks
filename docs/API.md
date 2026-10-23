@@ -62,7 +62,10 @@ Writes data to the current sheet.
 - `string` - Written as shared string
 - `number` - Written as number (integer or double)
 - `boolean` - Written as boolean
-- `Date` - Written as Excel date serial number
+- `Date` - Written as Excel date serial number. The serial is taken from the UTC
+  time (`getTime()`), not local wall-clock time: `new Date(2024, 5, 30)` in UTC+2
+  is stored as 2024-06-29 22:00 and shows that way in Excel. Use `Date.UTC(...)`
+  for date-only values
 - `null` / `undefined` - Written as empty cell
 
 **Example:**
@@ -203,6 +206,9 @@ Gets value at the specified column index in the current row.
 - `columnIndex` - Zero-based column index
 
 **Returns:** `CellValue` (string, number, boolean, Date, bigint, or null/undefined)
+
+Date cells are returned as `Date` objects built from the serial in UTC, the same
+convention the writers use, so a write/read round trip keeps the same instant.
 
 **Example:**
 ```typescript

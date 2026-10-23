@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unlike xlspy's padded `[None] * cols`, this reader yields a zero-length row.
   Code that counts rows must account for gap rows.
 
+### Documentation
+
+- Date conversion is UTC-based on both write and read: a `Date` is stored by its
+  UTC instant (`getTime()`), so `new Date(2024, 5, 30)` in UTC+2 appears as
+  2024-06-29 22:00 in Excel. Use `Date.UTC(...)` for date-only values.
+
 ### Added
 
 - `selectSheet(nameOrIndex)` and `nextResult()` on `ExcelReaderAbstract`,
