@@ -25,6 +25,11 @@ import type { CellValue } from '../../src/Formats';
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const COM_DIR = path.join(REPO_ROOT, 'comparison', 'com');
 const SPEC_PATH = path.join(COM_DIR, 'cases.json');
+
+if (!fs.existsSync(SPEC_PATH)) {
+    console.log('SKIP - comparison/com/cases.json not found; run this suite from the comparison workspace');
+    process.exit(0);
+}
 const FORMATS = ['xlsx', 'xlsb'] as const;
 type Format = (typeof FORMATS)[number];
 
