@@ -1,7 +1,7 @@
 import yauzl, { ZipFile, Entry } from 'yauzl';
 import { ExcelReaderAbstract } from './ExcelReaderAbstract';
 import { CellValue } from './Formats';
-import { unescapeXml, columnLetterToIndex, parseSharedStringsXml, parseTagAttributes, resolveRelTarget } from './xmlUtils';
+import { unescapeXml, unescapeXmlText, columnLetterToIndex, parseSharedStringsXml, parseTagAttributes, resolveRelTarget } from './xmlUtils';
 import { MAX_ROWS } from './writerHelpers';
 
 interface SheetInfo {
@@ -459,7 +459,7 @@ export class XlsxReader extends ExcelReaderAbstract {
 
             let finalVal: any = null;
             if (inlineVals !== null) {
-                finalVal = unescapeXml(inlineVals.join(''));
+                finalVal = unescapeXmlText(inlineVals.join(''));
             } else if (val !== null) {
                 if (type === 's') {
                     const idx = parseInt(val, 10);
@@ -467,13 +467,13 @@ export class XlsxReader extends ExcelReaderAbstract {
                 } else if (type === 'b') {
                     finalVal = (val === '1' || val === 'true');
                 } else if (type === 'inlineStr') {
-                    finalVal = unescapeXml(val);
+                    finalVal = unescapeXmlText(val);
                 } else if (type === 'str') {
-                    finalVal = unescapeXml(val);
+                    finalVal = unescapeXmlText(val);
                 } else if (type === 'e') {
                     finalVal = unescapeXml(val);
                 } else if (type === 'd') {
-                    finalVal = parseIsoDateUtc(val) ?? unescapeXml(val);
+                    finalVal = parseIsoDateUtc(val) ?? unescapeXmlText(val);
                 } else if (type === 'n' || type === '') {
                     finalVal = parseFloat(val);
 

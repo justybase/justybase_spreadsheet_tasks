@@ -5,7 +5,7 @@ import { XlsxReader } from '../../src/XlsxReader';
 import { XlsbReader } from '../../src/XlsbReader';
 import { XlsbWriter } from '../../src/XlsbWriter';
 import { XlsxWriter } from '../../src/XlsxWriter';
-import { unescapeXml, parseSharedStringsXml, parseTagAttributes, resolveRelTarget } from '../../src/xmlUtils';
+import { escapeXlsxText, escapeXmlText, unescapeXml, unescapeXmlText, parseSharedStringsXml, parseTagAttributes, resolveRelTarget } from '../../src/xmlUtils';
 import { createMinimalXlsx, mkTempDir } from '../helpers/minimalXlsx';
 
 const outputDir = mkTempDir('spreadsheet-reader-xml-');
@@ -62,6 +62,45 @@ async function testPhoneticAndSi(): Promise<void> {
     assert(vals[0] === 'plain', 'plain');
     assert(vals[1] === 'rich', `phon skipped got ${vals[1]}`);
     assert(vals[2] === '', 'self-closing si empty');
+}
+
+async function testLineEndNormalization(): Promise<void> {
+    // Raw CRLF / lone CR in element text are normalized to LF (XML 1.0 section 2.11).
+    const sst = '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>a\r\nb\rc</t></si><si><t>x&#13;y</t></si></sst>';
+    const vals = parseSharedStringsXml(sst);
+    assert(vals[0] === 'a\nb\nc', `CRLF/CR normalized got ${JSON.stringify(vals[0])}`);
+    assert(vals[1] === 'x\ry', `char reference keeps CR got ${JSON.stringify(vals[1])}`);
+    assert(unescapeXmlText('p\r\nq') === 'p\nq', 'unescapeXmlText normalizes raw CRLF');
+    assert(escapeXmlText('p\r\nq') === 'p&#13;\nq', 'writer escapes CR as char reference');
+    assert(unescapeXmlText(escapeXmlText('m\rn')) === 'm\rn', 'CR round-trips through writer and reader');
+}
+
+// Excel writes CR inside shared strings as _x000D_ (ST_Xstring); a literal _xHHHH_
+// typed by a user must be written escaped so that it reads back unchanged.
+async function testXstringEscapes(): Promise<void> {
+    const excelSst = '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>line1_x000D_\nline2</t></si><si><t>_x005F_x0041_</t></si></sst>';
+    const excelVals = parseSharedStringsXml(excelSst);
+    assert(excelVals[0] === 'line1\r\nline2', `_x000D_ decoded to CR got ${JSON.stringify(excelVals[0])}`);
+    assert(excelVals[1] === '_x0041_', `_x005F_ decodes to a literal underscore got ${JSON.stringify(excelVals[1])}`);
+
+    for (const literal of ['lit _x0041_ end', 'crlf\r\nand _x000D_', '_x005F_']) {
+        const sst = `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>${escapeXlsxText(literal)}</t></si></sst>`;
+        assert(parseSharedStringsXml(sst)[0] === literal, `escapeXlsxText round-trips ${JSON.stringify(literal)}`);
+    }
+
+    const f = path.join(outputDir, 'xstring-escapes.xlsx');
+    const writer = new XlsxWriter(f);
+    writer.addSheet('Sheet1');
+    writer.writeSheet([['line1\r\nline2', '_x0041_']], ['text', 'literal'], false);
+    await writer.finalize();
+    const reader = new XlsxReader();
+    await reader.open(f);
+    await reader.selectSheet(reader.getSheetNames()[0]);
+    assert(await reader.read(), 'xstring file has a header row');
+    assert(await reader.read(), 'xstring file has a data row');
+    assert(reader.getValue(0) === 'line1\r\nline2', `file CRLF round-trips got ${JSON.stringify(reader.getValue(0))}`);
+    assert(reader.getValue(1) === '_x0041_', `file literal _x0041_ round-trips got ${JSON.stringify(reader.getValue(1))}`);
+    reader.close();
 }
 
 async function testCellTypes(): Promise<void> {
@@ -232,6 +271,8 @@ async function main(): Promise<void> {
     await testParseTagAttributes();
     await testAbsolutePathAndAttrOrder();
     await testPhoneticAndSi();
+    await testLineEndNormalization();
+    await testXstringEscapes();
     await testCellTypes();
     await testSelfClosingRow();
     await testRowBreaksIsNotARow();

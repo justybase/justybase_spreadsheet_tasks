@@ -15,6 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unlike xlspy's padded `[None] * cols`, this reader yields a zero-length row.
   Code that counts rows must account for gap rows.
 
+### Changed
+
+- XLSX output omits the `r` attribute on cells that directly follow the previous
+  cell (`<c><v>1</v></c>`). A cell keeps `r` after a gap, at the start of a row that
+  does not begin in column A, and in the header row only when needed. Excel and the
+  readers in this package resolve the position from the order of cells.
+- XLSX and XLSB writers accept `{ compressionLevel }` (integer 0–9, default 6). The
+  archiver default was level 1, which compresses less.
+
+### Fixed
+
+- Raw CRLF and lone CR in XML text (shared strings, inline strings, `str` cells) are
+  normalized to LF on read, as XML 1.0 requires. `&#13;` still reads as CR.
+- `escapeXmlText` writes CR as `&#13;`, so a CR written by the library survives a
+  round trip instead of being normalized away. The XLSX writer now does the same in
+  shared strings, where a raw CR was previously written and read back as LF by Excel.
+- Text containing `_xHHHH_` is escaped as `_x005F_xHHHH_` when written, and
+  `_xHHHH_` written by Excel (for example `_x000D_`) is decoded on read (ECMA-376
+  ST_Xstring). Attribute values are not affected.
+- `XlsxUpdater` infers the column of a cell without `r` when it reads existing styles,
+  so style inheritance works for files produced by this library and by xlspy.
+
 ### Documentation
 
 - Date conversion is UTC-based on both write and read: a `Date` is stored by its

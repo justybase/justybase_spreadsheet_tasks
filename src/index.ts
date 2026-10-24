@@ -57,7 +57,9 @@ export { StreamingSheetState } from './StreamingSheetState';
 // Shared XML helpers (tag attributes, rel targets, column letters)
 export {
     escapeXmlText,
+    escapeXlsxText,
     unescapeXml,
+    unescapeXmlText,
     columnIndexToLetter,
     columnLetterToIndex,
     parseSharedStringsXml,

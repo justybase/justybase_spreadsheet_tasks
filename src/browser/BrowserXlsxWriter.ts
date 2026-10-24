@@ -12,6 +12,7 @@ import {
     assertRowFitsColumns as assertBrowserRowFits,
     assertRowCount as assertBrowserRowCount,
     timeToOaDate as timeToOaDateBrowser,
+    cellRefAttr,
 } from '../writerHelpers';
 
 export type BrowserHeaderStyle = 'bold' | 'fill' | 'bold+fill';
@@ -77,10 +78,13 @@ export class BrowserXlsxWriter {
     }
     _ex(s: string): string { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); }
     _esc(s: string): string {
+        // Literal `_xHHHH_` is written as `_x005F_xHHHH_` so Excel does not decode it (ST_Xstring).
+        s = s.replace(/_x([0-9A-Fa-f]{4})_/g, '_x005F_x$1_');
         let need = false;
-        for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || (c >= 0 && c <= 8) || c === 11 || c === 12 || (c >= 14 && c <= 31)) { need = true; break; } }
+        for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || c === 13 || (c >= 0 && c <= 8) || c === 11 || c === 12 || (c >= 14 && c <= 31)) { need = true; break; } }
         if (!need) return s;
-        const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+        // CR is a character reference: raw CR is normalized to LF by XML parsers.
+        const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;').replace(/\r/g, '&#13;');
         let out = '';
         for (let i = 0; i < escaped.length; i++) {
             const c = escaped.charCodeAt(i);
@@ -95,19 +99,20 @@ export class BrowserXlsxWriter {
         const sn = this._san(name); this._sc++;
         this._sl.push({ name: sn, path: `xl/worksheets/sheet${this._sc}.xml`, hidden, fn: `sheet${this._sc}.xml`, id: this._sc, rId: `rId${this._sc}`, fhr: null });
     }
-    _wsc(bb: BrowserBigBuffer, val: string, cr: string, rn: number, so?: number): void {
+    /** `ref` is the cell's `r` attribute from `cellRefAttr`, or '' when omitted. */
+    _wsc(bb: BrowserBigBuffer, val: string, ref: string, so?: number): void {
         assertBrowserCellText(val);
         let idx = this._sstM.get(val);
         if (idx === undefined) { idx = this._sstA.length; this._sstA.push(val); this._sstM.set(val, idx); }
         this._sstCnt++;
         const sa = so !== undefined ? ` s="${so}"` : '';
-        bb.writeString(`<c r="${cr}${rn}" t="s"${sa}><v>${idx}</v></c>`);
+        bb.writeString(`<c${ref} t="s"${sa}><v>${idx}</v></c>`);
     }
-    _wscStyle(bb: BrowserBigBuffer, val: string, cr: string, rn: number, styleId: number): void {
+    _wscStyle(bb: BrowserBigBuffer, val: string, ref: string, styleId: number): void {
         assertBrowserCellText(val);
         let idx = this._sstM.get(val);
         if (idx === undefined) { idx = this._sstA.length; this._sstA.push(val); this._sstM.set(val, idx); }
-        this._sstCnt++; bb.writeString(`<c r="${cr}${rn}" t="s" s="${styleId}"><v>${idx}</v></c>`);
+        this._sstCnt++; bb.writeString(`<c${ref} t="s" s="${styleId}"><v>${idx}</v></c>`);
     }
     _oa(d: Date): number { return timeToOaDateBrowser(d.getTime(), this._oaE); }
     _regFmt(fs: string): number {
@@ -119,19 +124,27 @@ export class BrowserXlsxWriter {
         this._fmtXf.set(fs, xf);
         return xf;
     }
-    _wcv(bb: BrowserBigBuffer, raw: CellValue, cr: string, rn: number): void {
-        if (raw === null || raw === undefined) return;
+    /**
+     * Write one cell of row `rn` at column `c` (letter `cr`). Returns the column
+     * of the last cell written, which the caller passes as `prevCol` for the next
+     * cell; a null cell writes nothing and leaves `prevCol` unchanged.
+     */
+    _wcv(bb: BrowserBigBuffer, raw: CellValue, c: number, cr: string, rn: number, prevCol: number): number {
+        if (raw === null || raw === undefined) return prevCol;
         const fs = getFormat(raw);
         const v = unwrapCell(raw);
         const xf = fs !== null ? this._regFmt(fs) : -1;
         const sa = xf >= 0 ? ` s="${xf}"` : '';
         // A formatted cell may wrap null/undefined; Node XlsxWriter skips it the same way.
-        if (v === null || v === undefined) return;
-        if (typeof v === 'number') { if (Number.isFinite(v)) bb.writeString(`<c r="${cr}${rn}"${sa}><v>${v}</v></c>`); else this._wsc(bb, v.toString(), cr, rn, xf >= 0 ? xf : void 0); }
-        else if (typeof v === 'bigint') this._wsc(bb, v.toString(), cr, rn, xf >= 0 ? xf : void 0);
-        else if (typeof v === 'boolean') bb.writeString(`<c r="${cr}${rn}" t="b"${sa}><v>${v ? 1 : 0}</v></c>`);
-        else if (v instanceof Date) { const o = this._oa(v); if (Number.isFinite(o)) bb.writeString(`<c r="${cr}${rn}" s="${xf >= 0 ? xf : 1}"><v>${o}</v></c>`); else this._wsc(bb, v.toString(), cr, rn, xf >= 0 ? xf : void 0); }
-        else this._wsc(bb, v.toString(), cr, rn, xf >= 0 ? xf : void 0);
+        if (v === null || v === undefined) return prevCol;
+        const ref = cellRefAttr(c, prevCol, cr, rn);
+        const so = xf >= 0 ? xf : void 0;
+        if (typeof v === 'number') { if (Number.isFinite(v)) bb.writeString(`<c${ref}${sa}><v>${v}</v></c>`); else this._wsc(bb, v.toString(), ref, so); }
+        else if (typeof v === 'bigint') this._wsc(bb, v.toString(), ref, so);
+        else if (typeof v === 'boolean') bb.writeString(`<c${ref} t="b"${sa}><v>${v ? 1 : 0}</v></c>`);
+        else if (v instanceof Date) { const o = this._oa(v); if (Number.isFinite(o)) bb.writeString(`<c${ref} s="${xf >= 0 ? xf : 1}"><v>${o}</v></c>`); else this._wsc(bb, v.toString(), ref, so); }
+        else this._wsc(bb, v.toString(), ref, so);
+        return c;
     }
     _sheetHead(bb: BrowserBigBuffer, cc: number, isFirst: boolean, hasAF: boolean): void {
         bb.writeString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
@@ -158,14 +171,14 @@ export class BrowserXlsxWriter {
         const cl: string[] = new Array(colCount); for (let i = 0; i < colCount; i++) cl[i] = this._cl(i); this._csCL = cl;
         if (headers) for (let i = 0; i < colCount; i++) { let w = 1.3 * (headers[i] ? headers[i].length : 0) + 3; if (w > 80) w = 80; if (this._cw[i] < w) this._cw[i] = w; }
         this._sheetHead(csb, colCount, this._sc === 1, this._csAF);
-        if (headers) { this._csrn++; csb.writeString(`<row r="${this._csrn}">`); for (let c = 0; c < headers.length; c++) this._wscStyle(csb, headers[c], cl[c], this._csrn, hs); csb.writeString('</row>'); }
+        if (headers) { this._csrn++; csb.writeString(`<row r="${this._csrn}">`); for (let c = 0; c < headers.length; c++) this._wscStyle(csb, headers[c], '', hs); csb.writeString('</row>'); }
     }
     writeRow(row: CellValue[]): void {
         if (!this._isS || this._csb === null) throw new Error('Not streaming');
         if (row.length !== this._csEC) throw new Error(`Row length mismatch. Expected ${this._csEC} columns, got ${row.length}`);
         const csb = this._csb;
         this._csrn++; assertBrowserRowCount(this._csrn); csb.writeString(`<row r="${this._csrn}">`);
-        for (let c = 0; c < row.length; c++) this._wcv(csb, row[c], this._csCL[c], this._csrn);
+        let prev = -1; for (let c = 0; c < row.length; c++) prev = this._wcv(csb, row[c], c, this._csCL[c], this._csrn, prev);
         csb.writeString('</row>');
     }
     endSheet(): void {
@@ -199,8 +212,8 @@ export class BrowserXlsxWriter {
         }
         this._sheetHead(bb, cc, this._sc === 1, doAutofilter && !!headers);
         let rn = 0;
-        if (headers) { rn++; bb.writeString(`<row r="${rn}">`); for (let c = 0; c < headers.length; c++) this._wscStyle(bb, headers[c], cl[c], rn, hs); bb.writeString('</row>'); }
-        for (let r = 0; r < rows.length; r++) { rn++; bb.writeString(`<row r="${rn}">`); for (let c = 0; c < rows[r].length; c++) this._wcv(bb, rows[r][c], cl[c], rn); bb.writeString('</row>'); }
+        if (headers) { rn++; bb.writeString(`<row r="${rn}">`); for (let c = 0; c < headers.length; c++) this._wscStyle(bb, headers[c], '', hs); bb.writeString('</row>'); }
+        for (let r = 0; r < rows.length; r++) { rn++; bb.writeString(`<row r="${rn}">`); let prev = -1; for (let c = 0; c < rows[r].length; c++) prev = this._wcv(bb, rows[r][c], c, cl[c], rn, prev); bb.writeString('</row>'); }
         bb.writeString('</sheetData>');
         if (doAutofilter && headers && cc > 0) { this._afOn = true; const fr = `A1:${cl[cc - 1]}${tr}`; bb.writeString(`<autoFilter ref="${fr}"/>`); const sh = this._sl[this._sc - 1]; sh.fhr = `${this._fmn(sh.name)}!$A$1:$${cl[cc - 1]}$${tr}`; }
         bb.writeString('</worksheet>');

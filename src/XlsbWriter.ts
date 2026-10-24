@@ -17,6 +17,8 @@ import {
     assertRowFitsColumns,
     assertRowCount,
     timeToOaDate,
+    assertCompressionLevel,
+    DEFAULT_COMPRESSION_LEVEL,
 } from './writerHelpers';
 
 interface SheetInfo {
@@ -82,7 +84,12 @@ export class XlsbWriter {
     /**
      * @param filePath Destination `.xlsb` path on disk.
      */
-    constructor(filePath: string) {
+    /**
+     * @param filePath Destination `.xlsb` path on disk.
+     * @param options.compressionLevel Deflate level 0-9 (default 6).
+     */
+    constructor(filePath: string, options: { compressionLevel?: number } = {}) {
+        const compressionLevel = assertCompressionLevel(options.compressionLevel ?? DEFAULT_COMPRESSION_LEVEL);
         this._targetPath = path.resolve(filePath);
         fs.mkdirSync(path.dirname(this._targetPath), { recursive: true });
         this._tempPath = path.join(
@@ -91,7 +98,7 @@ export class XlsbWriter {
         );
         this.output = fs.createWriteStream(this._tempPath);
         this.output.on('error', (err: Error) => { this._outputError = err; });
-        this.archive = archiver('zip');
+        this.archive = archiver('zip', { zlib: { level: compressionLevel } });
         this.archive.on('error', (err: Error) => { this._outputError = err; });
 
         this.archive.pipe(this.output);

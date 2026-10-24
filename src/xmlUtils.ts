@@ -27,15 +27,17 @@ function stripInvalidControlChars(str: string): string {
 
 /** Escape text content for use inside an XML element body. */
 export function escapeXmlText(str: string): string {
-    if (!/&|<|>|"|'/.test(str) && !hasInvalidControlChars(str)) {
+    if (!/[&<>"'\r]/.test(str) && !hasInvalidControlChars(str)) {
         return str;
     }
+    // CR is written as &#13; so readers that normalize raw line ends keep it.
     let out = str
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
-        .replace(/'/g, '&apos;');
+        .replace(/'/g, '&apos;')
+        .replace(/\r/g, '&#13;');
     if (hasInvalidControlChars(out)) {
         out = stripInvalidControlChars(out);
     }
@@ -67,6 +69,28 @@ export function unescapeXml(str: string): string {
             }
         }
     });
+}
+
+/**
+ * Escape text of a shared string or inline string. Beyond XML escaping, a literal
+ * `_xHHHH_` must be written as `_x005F_xHHHH_` because Excel decodes that pattern
+ * in these elements (ECMA-376 ST_Xstring). Attribute values use `escapeXmlText`.
+ */
+export function escapeXlsxText(str: string): string {
+    return escapeXmlText(str.replace(/_x([0-9A-Fa-f]{4})_/g, '_x005F_x$1_'));
+}
+
+/**
+ * Unescape element text content. Raw CR LF and lone CR are normalized to LF first
+ * (XML 1.0 §2.11); character references such as `&#13;` are kept as CR. Then the
+ * ST_Xstring escape `_xHHHH_` that Excel writes for control characters is decoded.
+ */
+export function unescapeXmlText(str: string): string {
+    if (!str) return str;
+    const text = unescapeXml(str.indexOf('\r') === -1 ? str : str.replace(/\r\n?/g, '\n'));
+    return text.indexOf('_x') === -1
+        ? text
+        : text.replace(/_x([0-9A-Fa-f]{4})_/g, (_match: string, hex: string) => String.fromCharCode(parseInt(hex, 16)));
 }
 
 /** Parse XML tag attributes into a map, independent of order/prefix/quote style. */
@@ -160,7 +184,7 @@ export function parseSharedStringsXml(xml: string): string[] {
         while ((textMatch = textRegex.exec(content)) !== null) {
             value += textMatch[1];
         }
-        result.push(unescapeXml(value));
+        result.push(unescapeXmlText(value));
     }
     return result;
 }

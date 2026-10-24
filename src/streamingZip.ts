@@ -5,6 +5,7 @@ import { finished } from 'stream/promises';
 import { Readable } from 'stream';
 import AdmZip from 'adm-zip';
 import archiver from 'archiver';
+import { DEFAULT_COMPRESSION_LEVEL } from './writerHelpers';
 
 /** A file-backed replacement for one ZIP member. */
 export type StagedZipPart = Map<string, string>;
@@ -94,7 +95,7 @@ export async function writeAdmZipStreaming(
             outputError = err;
             try { archive?.abort(); } catch { /* preserve */ }
         });
-        archive = archiver('zip');
+        archive = archiver('zip', { zlib: { level: DEFAULT_COMPRESSION_LEVEL } });
         archive.on('error', (err: Error) => {
             outputError = err;
         });

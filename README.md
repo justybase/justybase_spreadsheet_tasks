@@ -179,6 +179,17 @@ await writer.finalize();
 - Generate data on-the-fly from databases, APIs, or other sources
 - Same performance as batch mode
 
+### Compression Level
+
+XLSX and XLSB writers compress the package with zlib. The default is level 6; pass a
+level from 0 (store) to 9 (smallest, slowest) to trade size for speed:
+
+```typescript
+const writer = new XlsxWriter('fast.xlsx', { compressionLevel: 1 });
+```
+
+Out-of-range values throw a `RangeError`.
+
 ### Reading Excel Files
 
 ```typescript

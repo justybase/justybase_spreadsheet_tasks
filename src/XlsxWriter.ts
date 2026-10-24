@@ -17,6 +17,9 @@ import {
     assertRowFitsColumns,
     assertRowCount,
     timeToOaDate,
+    cellRefAttr,
+    assertCompressionLevel,
+    DEFAULT_COMPRESSION_LEVEL,
 } from './writerHelpers';
 import { columnIndexToLetter } from './xmlUtils';
 
@@ -62,7 +65,12 @@ export class XlsxWriter {
     /**
      * @param filePath Destination `.xlsx` path on disk.
      */
-    constructor(filePath: string) {
+    /**
+     * @param filePath Destination `.xlsx` path on disk.
+     * @param options.compressionLevel Deflate level 0-9 (default 6).
+     */
+    constructor(filePath: string, options: { compressionLevel?: number } = {}) {
+        const compressionLevel = assertCompressionLevel(options.compressionLevel ?? DEFAULT_COMPRESSION_LEVEL);
         this._targetPath = path.resolve(filePath);
         fs.mkdirSync(path.dirname(this._targetPath), { recursive: true });
         this._tempPath = path.join(
@@ -71,7 +79,7 @@ export class XlsxWriter {
         );
         this.output = fs.createWriteStream(this._tempPath);
         this.output.on('error', (err: Error) => { this._outputError = err; });
-        this.archive = archiver('zip');
+        this.archive = archiver('zip', { zlib: { level: compressionLevel } });
         this.archive.on('error', (err: Error) => { this._outputError = err; });
 
         this.archive.pipe(this.output);
@@ -128,7 +136,7 @@ export class XlsxWriter {
     private _needsEscape(str: string): boolean {
         for (let i = 0; i < str.length; i++) {
             const c = str.charCodeAt(i);
-            if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 ||
+            if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || c === 13 ||
                 (c >= 0 && c <= 8) || c === 11 || c === 12 || (c >= 14 && c <= 31)) {
                 return true;
             }
@@ -138,6 +146,8 @@ export class XlsxWriter {
 
     private _escape(str: string): string {
         if (typeof str !== 'string') return str;
+        // Literal `_xHHHH_` is written as `_x005F_xHHHH_` so Excel does not decode it (ST_Xstring).
+        str = str.replace(/_x([0-9A-Fa-f]{4})_/g, '_x005F_x$1_');
         if (!this._needsEscape(str)) return str;
 
         return str.replace(/&/g, '&amp;')
@@ -145,6 +155,8 @@ export class XlsxWriter {
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&apos;')
+            // CR must be a character reference: raw CR is normalized to LF by XML parsers.
+            .replace(/\r/g, '&#13;')
             // eslint-disable-next-line no-control-regex
             .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
     }
@@ -215,8 +227,9 @@ export class XlsxWriter {
         if (headers) {
             this.stream.rowNum++;
             bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
+            // Headers are contiguous from column A, so no cell needs `r`.
             for (let c = 0; c < headers.length; c++) {
-                this._writeStringCell(bigBuf, headers[c], colLetters[c], this.stream.rowNum, 3);
+                this._writeStringCell(bigBuf, headers[c], '', 3);
             }
             bigBuf.writeString('</row>');
         }
@@ -236,6 +249,7 @@ export class XlsxWriter {
         assertRowCount(this.stream.rowNum);
         bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
 
+        let prevCol = -1;
         for (let c = 0; c < row.length; c++) {
             const raw = row[c];
             if (raw === null || raw === undefined) continue;
@@ -245,27 +259,28 @@ export class XlsxWriter {
             const xfIdx = fmtString !== null ? this._registerFormat(fmtString) : -1;
             const styleAttr = xfIdx >= 0 ? ` s="${xfIdx}"` : '';
 
-            const colRef = this.currentColLetters[c];
+            const ref = cellRefAttr(c, prevCol, this.currentColLetters[c], this.stream.rowNum);
+            prevCol = c;
             if (typeof val === 'number') {
                 if (Number.isFinite(val)) {
-                    bigBuf.writeString(`<c r="${colRef}${this.stream.rowNum}"${styleAttr}><v>${val}</v></c>`);
+                    bigBuf.writeString(`<c${ref}${styleAttr}><v>${val}</v></c>`);
                 } else {
-                    this._writeStringCell(bigBuf, val.toString(), colRef, this.stream.rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
                 }
             } else if (typeof val === 'bigint') {
-                this._writeStringCell(bigBuf, val.toString(), colRef, this.stream.rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
             } else if (typeof val === 'boolean') {
-                bigBuf.writeString(`<c r="${colRef}${this.stream.rowNum}" t="b"${styleAttr}><v>${val ? 1 : 0}</v></c>`);
+                bigBuf.writeString(`<c${ref} t="b"${styleAttr}><v>${val ? 1 : 0}</v></c>`);
             } else if (val instanceof Date) {
                 const oaDate = this._toOADate(val);
                 if (Number.isFinite(oaDate)) {
                     const finalStyle = xfIdx >= 0 ? xfIdx : 1;
-                    bigBuf.writeString(`<c r="${colRef}${this.stream.rowNum}" s="${finalStyle}"><v>${oaDate}</v></c>`);
+                    bigBuf.writeString(`<c${ref} s="${finalStyle}"><v>${oaDate}</v></c>`);
                 } else {
-                    this._writeStringCell(bigBuf, val.toString(), colRef, this.stream.rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
                 }
             } else if (val !== null && val !== undefined) {
-                this._writeStringCell(bigBuf, val.toString(), colRef, this.stream.rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
             }
         }
         bigBuf.writeString('</row>');
@@ -368,8 +383,9 @@ export class XlsxWriter {
         if (headers) {
             rowNum++;
             bigBuf.writeString(`<row r="${rowNum}">`);
+            // Headers are contiguous from column A, so no cell needs `r`.
             for (let c = 0; c < headers.length; c++) {
-                this._writeStringCell(bigBuf, headers[c], colLetters[c], rowNum, 3);
+                this._writeStringCell(bigBuf, headers[c], '', 3);
             }
             bigBuf.writeString('</row>');
         }
@@ -378,6 +394,7 @@ export class XlsxWriter {
             rowNum++;
             bigBuf.writeString(`<row r="${rowNum}">`);
             const row = rows[r];
+            let prevCol = -1;
             for (let c = 0; c < row.length; c++) {
                 const raw = row[c];
                 if (raw === null || raw === undefined) continue;
@@ -387,27 +404,28 @@ export class XlsxWriter {
                 const xfIdx = fmtString !== null ? this._registerFormat(fmtString) : -1;
                 const styleAttr = xfIdx >= 0 ? ` s="${xfIdx}"` : '';
 
-                const colRef = colLetters[c];
+                const ref = cellRefAttr(c, prevCol, colLetters[c], rowNum);
+                prevCol = c;
                 if (typeof val === 'number') {
                     if (Number.isFinite(val)) {
-                        bigBuf.writeString(`<c r="${colRef}${rowNum}"${styleAttr}><v>${val}</v></c>`);
+                        bigBuf.writeString(`<c${ref}${styleAttr}><v>${val}</v></c>`);
                     } else {
-                        this._writeStringCell(bigBuf, val.toString(), colRef, rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                        this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
                     }
                 } else if (typeof val === 'bigint') {
-                    this._writeStringCell(bigBuf, val.toString(), colRef, rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
                 } else if (typeof val === 'boolean') {
-                    bigBuf.writeString(`<c r="${colRef}${rowNum}" t="b"${styleAttr}><v>${val ? 1 : 0}</v></c>`);
+                    bigBuf.writeString(`<c${ref} t="b"${styleAttr}><v>${val ? 1 : 0}</v></c>`);
                 } else if (val instanceof Date) {
                     const oaDate = this._toOADate(val);
                     if (Number.isFinite(oaDate)) {
                         const finalStyle = xfIdx >= 0 ? xfIdx : 1;
-                        bigBuf.writeString(`<c r="${colRef}${rowNum}" s="${finalStyle}"><v>${oaDate}</v></c>`);
+                        bigBuf.writeString(`<c${ref} s="${finalStyle}"><v>${oaDate}</v></c>`);
                     } else {
-                        this._writeStringCell(bigBuf, val.toString(), colRef, rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                        this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
                     }
                 } else if (val !== null && val !== undefined) {
-                    this._writeStringCell(bigBuf, val.toString(), colRef, rowNum, xfIdx >= 0 ? xfIdx : undefined);
+                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
                 }
             }
             bigBuf.writeString('</row>');
@@ -432,7 +450,8 @@ export class XlsxWriter {
         });
     }
 
-    private _writeStringCell(bigBuf: BigBuffer, val: string, colRef: string, rowNum: number, styleOverride?: number): void {
+    /** `ref` is the cell's `r` attribute from `cellRefAttr`, or '' when omitted. */
+    private _writeStringCell(bigBuf: BigBuffer, val: string, ref: string, styleOverride?: number): void {
         assertCellTextLength(val);
         let index = this.sstMap.get(val);
         if (index === undefined) {
@@ -442,7 +461,7 @@ export class XlsxWriter {
         }
         this.sstCntAll++;
         const styleAttr = styleOverride !== undefined ? ` s="${styleOverride}"` : '';
-        bigBuf.writeString(`<c r="${colRef}${rowNum}" t="s"${styleAttr}><v>${index}</v></c>`);
+        bigBuf.writeString(`<c${ref} t="s"${styleAttr}><v>${index}</v></c>`);
     }
 
     private _registerFormat(fmtString: string): number {

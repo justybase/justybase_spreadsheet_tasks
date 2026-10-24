@@ -152,3 +152,23 @@ export function defaultColWidth(width: number, floor: boolean = false): number {
     }
     return 10;
 }
+
+/**
+ * The `r` attribute of a cell (leading space included), or '' when the cell
+ * directly follows the previous written cell in its row. Such cells take their
+ * column from their position, so `r` is only needed after a gap. The first cell
+ * of a row has `prevCol = -1` and sits in column A without `r`.
+ */
+export function cellRefAttr(col: number, prevCol: number, colRef: string, rowNum: number): string {
+    return col === prevCol + 1 ? '' : ` r="${colRef}${rowNum}"`;
+}
+
+/** Deflate level for the ZIP package. 6 is the zlib default; level 1 (archiver's own default) makes sheet XML about twice as large. */
+export const DEFAULT_COMPRESSION_LEVEL = 6;
+
+export function assertCompressionLevel(level: number): number {
+    if (!Number.isInteger(level) || level < 0 || level > 9) {
+        throw new RangeError(`compressionLevel must be an integer from 0 to 9, got ${level}`);
+    }
+    return level;
+}

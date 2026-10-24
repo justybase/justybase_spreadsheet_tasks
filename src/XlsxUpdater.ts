@@ -8,6 +8,7 @@ import { writeAdmZipStreaming, StagedZipPart } from './streamingZip';
 import { timeToOaDate } from './writerHelpers';
 import {
     escapeXmlText,
+    escapeXlsxText,
     columnIndexToLetter,
     columnLetterToIndex,
     parseSharedStringsXml,
@@ -607,7 +608,7 @@ export class XlsxUpdater {
         }
 
         const appended = this.sharedStringsPending.map(txt => {
-            const clean = escapeXmlText(txt);
+            const clean = escapeXlsxText(txt);
             const preserve = clean.length > 0 && (clean[0] === ' ' || clean[clean.length - 1] === ' ' || /[\t\n\r]/.test(clean));
             const tAttr = preserve ? ' xml:space="preserve"' : '';
             return `<${prefix}si><${prefix}t${tAttr}>${clean}</${prefix}t></${prefix}si>`;
@@ -635,14 +636,27 @@ export class XlsxUpdater {
         if (sdEnd === -1) return { dataStyles: new Map(), headerStyles };
 
         const region = sheetXml.substring(sdStart, sdEnd);
-        const cellRe = /<c\b[^>]*>/g;
+        // `r` on a cell is optional: a cell without it sits right after the previous
+        // cell of its row (column A when first), so track the position per row.
+        const cellRe = /<row\b[^>]*>|<c\b[^>]*>/g;
         let m;
+        let row = 0;
+        let nextCol = 0;
         while ((m = cellRe.exec(region)) !== null) {
             const tag = m[0];
+            if (tag.startsWith('<row')) {
+                const rowAttr = /\br="(\d+)"/.exec(tag);
+                row = rowAttr ? parseInt(rowAttr[1], 10) : row + 1;
+                nextCol = 0;
+                continue;
+            }
             const rMatch = /r="([A-Z]+)(\d+)"/.exec(tag);
-            if (!rMatch) continue;
-            const col = columnLetterToIndex(rMatch[1]);
-            const row = parseInt(rMatch[2], 10);
+            let col = nextCol;
+            if (rMatch) {
+                col = columnLetterToIndex(rMatch[1]);
+                row = parseInt(rMatch[2], 10);
+            }
+            nextCol = col + 1;
             const sMatch = /s="(\d+)"/.exec(tag);
             if (!sMatch) continue;
             const s = parseInt(sMatch[1], 10);
@@ -792,7 +806,7 @@ export class XlsxUpdater {
         const styleAttr = style > 0 ? ` s="${style}"` : '';
 
         if (this.sharedStringsXml === null) {
-            const clean = escapeXmlText(text);
+            const clean = escapeXlsxText(text);
             const preserve = clean.length > 0 && (clean[0] === ' ' || clean[clean.length - 1] === ' ' || /[\t\n\r]/.test(clean));
             const tAttr = preserve ? ' xml:space="preserve"' : '';
             return `<c r="${colRef}${rowNum}" t="inlineStr"${styleAttr}><is><t${tAttr}>${clean}</t></is></c>`;
