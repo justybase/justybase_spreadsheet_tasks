@@ -181,7 +181,7 @@ await writer.finalize();
 
 ### Compression Level
 
-XLSX and XLSB writers compress the package with zlib. The default is level 6; pass a
+XLSX and XLSB writers compress the package with zlib. The default is level 3; pass a
 level from 0 (store) to 9 (smallest, slowest) to trade size for speed:
 
 ```typescript

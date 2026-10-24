@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The default ZIP compression level is 3 (was 6) for XLSX, XLSB and the
+  streaming updater. Level 6 made XLSB writes about 2.6x slower for an 8%
+  smaller file.
+
 ## [3.1.0] - 2026-10-24
 
 ### Changed

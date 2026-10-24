@@ -163,8 +163,8 @@ export function cellRefAttr(col: number, prevCol: number, colRef: string, rowNum
     return col === prevCol + 1 ? '' : ` r="${colRef}${rowNum}"`;
 }
 
-/** Deflate level for the ZIP package. 6 is the zlib default; level 1 (archiver's own default) makes sheet XML about twice as large. */
-export const DEFAULT_COMPRESSION_LEVEL = 6;
+/** Deflate level for the ZIP package. 3 trades speed for size; 6 is zlib's default and made XLSB writes about 2.6x slower for an 8% smaller file. */
+export const DEFAULT_COMPRESSION_LEVEL = 3;
 
 export function assertCompressionLevel(level: number): number {
     if (!Number.isInteger(level) || level < 0 || level > 9) {

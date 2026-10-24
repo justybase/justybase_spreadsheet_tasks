@@ -67,7 +67,7 @@ export class XlsxWriter {
      */
     /**
      * @param filePath Destination `.xlsx` path on disk.
-     * @param options.compressionLevel Deflate level 0-9 (default 6).
+     * @param options.compressionLevel Deflate level 0-9 (default 3).
      */
     constructor(filePath: string, options: { compressionLevel?: number } = {}) {
         const compressionLevel = assertCompressionLevel(options.compressionLevel ?? DEFAULT_COMPRESSION_LEVEL);

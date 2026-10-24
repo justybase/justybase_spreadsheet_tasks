@@ -86,7 +86,7 @@ export class XlsbWriter {
      */
     /**
      * @param filePath Destination `.xlsb` path on disk.
-     * @param options.compressionLevel Deflate level 0-9 (default 6).
+     * @param options.compressionLevel Deflate level 0-9 (default 3).
      */
     constructor(filePath: string, options: { compressionLevel?: number } = {}) {
         const compressionLevel = assertCompressionLevel(options.compressionLevel ?? DEFAULT_COMPRESSION_LEVEL);
