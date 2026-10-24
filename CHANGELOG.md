@@ -7,13 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Breaking
-
-- `XlsxReader` / `XlsbReader` now return an empty row (`[]`, `getValue()` → `null`)
-  for every missing row position, including leading gaps, based on the row `r`
-  attribute (XLSX) and `BrtRowHdr` (XLSB). Like xlspy, gap positions are yielded;
-  unlike xlspy's padded `[None] * cols`, this reader yields a zero-length row.
-  Code that counts rows must account for gap rows.
+## [3.1.0] - 2026-10-24
 
 ### Changed
 
@@ -36,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ST_Xstring). Attribute values are not affected.
 - `XlsxUpdater` infers the column of a cell without `r` when it reads existing styles,
   so style inheritance works for files produced by this library and by xlspy.
+
+## [3.0.0] - 2026-10-23
+
+### Breaking
+
+- `XlsxReader` / `XlsbReader` now return an empty row (`[]`, `getValue()` → `null`)
+  for every missing row position, including leading gaps, based on the row `r`
+  attribute (XLSX) and `BrtRowHdr` (XLSB). Like xlspy, gap positions are yielded;
+  unlike xlspy's padded `[None] * cols`, this reader yields a zero-length row.
+  Code that counts rows must account for gap rows.
 
 ### Documentation
 
