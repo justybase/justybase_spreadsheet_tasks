@@ -22,12 +22,11 @@ import { XlsxUpdater } from '../../src/XlsxUpdater';
 import { XlsbUpdater } from '../../src/XlsbUpdater';
 import type { CellValue } from '../../src/Formats';
 
-const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
-const COM_DIR = path.join(REPO_ROOT, 'comparison', 'com');
+const COM_DIR = __dirname;
 const SPEC_PATH = path.join(COM_DIR, 'cases.json');
 
 if (!fs.existsSync(SPEC_PATH)) {
-    console.log('SKIP - comparison/com/cases.json not found; run this suite from the comparison workspace');
+    console.log('SKIP - tests/excel-com/cases.json not found');
     process.exit(0);
 }
 const FORMATS = ['xlsx', 'xlsb'] as const;
@@ -177,7 +176,11 @@ const isStructureCheck = (check: string) => !check.startsWith('cells:') && !chec
 // Session: writes every case, verifies with Excel, and creates Excel fixtures once.
 // ─────────────────────────────────────────────────────────────────────────────
 
+const requested = process.env.EXCEL_COM === '1';
 const available = excelAvailable();
+if (requested && !available) {
+    throw new Error('EXCEL_COM=1 but Microsoft Excel and/or PowerShell 7 (pwsh) is not available');
+}
 const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'justybase-com-'));
 const writtenDir = path.join(workDir, 'written');
 const fixtureDir = path.join(workDir, 'excel-fixtures');
@@ -204,7 +207,7 @@ function caseFormatPairs(): Array<[string, Format]> {
 }
 
 before(async () => {
-    if (!available) return;
+    if (!requested) return;
     fs.mkdirSync(writtenDir, { recursive: true });
     const targets: VerifyTarget[] = [];
     for (const c of spec.cases) {
@@ -242,7 +245,7 @@ async function readSheetRows(reader: XlsxReader | XlsbReader, sheetName: string)
     return rows;
 }
 
-const suite = available ? describe : describe.skip;
+const suite = requested ? describe : describe.skip;
 
 suite('Excel COM conformance', () => {
     for (const [caseId, format] of caseFormatPairs()) {

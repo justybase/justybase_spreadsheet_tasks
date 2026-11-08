@@ -28,7 +28,16 @@ High-performance TypeScript library for reading and writing Excel files in XLSB 
 - **TypeScript First** — Full TypeScript support with type definitions
 - **Dual Format Support** — Read and write both XLSB and XLSX formats
 - **Lightweight Node Dependencies** — Small ZIP-focused runtime deps (`adm-zip`, `archiver`, `yauzl`); no heavy Excel framework
-- **Streaming Support** — Efficient memory usage for large files
+- **Streaming Support** - Efficient memory usage for large files
+- **Shared Writer Core** - Node and browser writers emit byte-identical package parts
+- **Inline or Shared Strings** - Opt into inline strings for high-cardinality text
+- **Buffer I/O** - `openBuffer()` reads a workbook from memory; `readAll()`/`rows()` batch APIs
+- **Styles and Formats** - Fonts, fills, borders, alignment, protection and number formats (`CellStyle`)
+- **Formulas** - Write formula cells with cached values (`FormulaCell`); XLSX and a curated XLSB formula subset
+- **Sheet Features** - Merged cells, hyperlinks, data validation, comments and conditional formatting in XLSX; merges, hyperlinks and validation in XLSB
+- **Rich Text** - Formatted text runs in XLSX shared and inline strings
+- **Conservative Column Autofit** - Not narrower than xlspy/Excel AutoFit up to the 200 cap; explicit `columnWidths` override it
+- **Excel Error Values** - Read and write `#DIV/0!`, `#N/A` and the other Excel errors
 - **Multiple Sheets** — Support for multiple worksheets per workbook
 - **Auto-filter** — Automatic filter headers support
 - **Excel COM Conversion** — Convert XLSB and XLSX through desktop Microsoft Excel on Windows
@@ -190,6 +199,19 @@ const writer = new XlsxWriter('fast.xlsx', { compressionLevel: 1 });
 
 Out-of-range values throw a `RangeError`.
 
+### Inline Strings
+
+Writers use a shared-string table by default, which is fastest when text repeats.
+For high-cardinality text (IDs, messages) inline strings can reduce peak memory:
+
+```typescript
+const xlsx = new XlsxWriter('inline.xlsx', { useSharedStrings: false });
+const xlsb = new XlsbWriter('inline.xlsb', { useSharedStrings: false });
+```
+
+The browser writers accept the same option:
+`new BrowserXlsxWriter({ useSharedStrings: false })`.
+
 ### Reading Excel Files
 
 ```typescript
@@ -213,6 +235,101 @@ while (await reader.read()) {
 const xlsbReader = new XlsbReader();
 await xlsbReader.open('data.xlsb');
 // ... same API as above
+```
+
+Batch and in-memory APIs avoid the per-row `await`/`getValue` loop:
+
+```typescript
+const reader = new XlsxReader();
+await reader.openBuffer(buffer);          // ZIP bytes, e.g. from fetch() or fs.readFileSync()
+await reader.selectSheet(0);              // or a sheet name
+const rows = await reader.readAll();       // CellValue[][] (header row included)
+
+for await (const row of reader.rows()) {   // streaming without holding the sheet
+    consume(row);
+}
+
+// Synchronous fast path after selectSheet(): the returned array is reused until the next call.
+let row: CellValue[] | null;
+while ((row = reader.readRow()) !== null) {
+    consume(row.slice());                  // copy if you keep it
+}
+```
+
+Excel error cells are returned as their display text (`'#DIV/0!'`). To write an error,
+wrap it in `ExcelError`:
+
+```typescript
+import { ExcelError } from '@justybase/spreadsheet-tasks';
+writer.writeSheet([[new ExcelError('#N/A'), 1, 2]]);
+```
+
+### Styles, Formulas and Sheet Features
+
+Cells can carry a full style, a formula with a cached value, or rich text:
+
+```typescript
+import { XlsxWriter, RichText } from '@justybase/spreadsheet-tasks';
+
+const writer = new XlsxWriter('report.xlsx');
+writer.addSheet('Report');
+writer.writeSheet(
+    [
+        [
+            { value: 1234.5, style: { numFmt: '#,##0.00', font: { bold: true, color: 'FF0000' }, fill: { fgColor: 'FFFF00' } } },
+            { formula: 'SUM(A2:A3)', value: 1234.5 },
+            new RichText([
+                { text: 'red', style: { font: { color: 'FF0000' } } },
+                { text: ' plain' },
+            ]),
+        ],
+        [200, { formula: 'A2*2', value: 400 }, 'x'],
+    ],
+    ['Amount', 'Total', 'Note'],
+    {
+        merges: ['A4:B4'],
+        hyperlinks: [{ ref: 'C1', target: 'https://example.com', tooltip: 'Example' }],
+        dataValidations: [{ sqref: 'C2:C5', type: 'list', values: ['x', 'y'] }],
+        conditionalFormats: [{
+            sqref: 'A2:A3',
+            rules: [{ type: 'cellIs', operator: 'greaterThan', formula: ['1000'], style: { font: { bold: true } } }],
+        }],
+        comments: [{ ref: 'A2', text: 'Reviewed', author: 'Analyst' }],
+        columnWidths: [18, 14], // optional; otherwise conservative autofit is used
+    },
+);
+await writer.finalize();
+```
+
+`columnWidths` wins over autofit. Autofit itself is deliberately conservative:
+it looks at the header plus up to 200 sample rows (xlspy measures up to 1000) and
+estimates widths from character costs calibrated against xlspy's widest font
+metrics. The estimate includes CJK/fullwidth characters, emoji, bold/italic
+text, font size, wide font families, common number/date formats, alignment
+indent, the longest line of wrapped text and negative number-format sections.
+It enforces Excel's 8.43 minimum, reserves room for the autofilter button, adds
+the 5/7-character cell padding when writing, and caps the stored width at 200.
+The estimate errs on the wide side so columns are not narrower than
+xlspy/Excel AutoFit up to that cap. In streaming mode the sheet head is delayed
+until the first 200 data rows have been measured. Explicit
+`columnWidths` must be 0.5-255 characters and are written unchanged.
+
+XLSB supports `CellStyle`, `FormulaCell` (a formula subset with cached values),
+`merges`, `hyperlinks`, `dataValidations` and `columnWidths`. Rich text,
+comments and conditional formatting are XLSX-only and throw a clear error when
+passed to an XLSB writer.
+
+XlsxReader exposes the style, formula and rich-text runs of the last read row:
+
+```typescript
+const reader = new XlsxReader();
+await reader.open('report.xlsx');
+await reader.selectSheet('Report');
+while (reader.readRow() !== null) {
+    const style = reader.getStyle(0);     // CellStyle | null
+    const formula = reader.getFormula(1); // string | null (no leading '=')
+    const rich = reader.getRichText(2);   // RichText | null
+}
 ```
 
 ### Updating Data in an Existing Workbook
@@ -343,8 +460,12 @@ npm test
 Before opening a pull request:
 
 1. Run `npm run lint` and `npm test`.
-2. Add or update tests if you change behavior.
-3. Update [CHANGELOG.md](./CHANGELOG.md) for user-visible changes.
+2. Run `npm run benchmark:io:baseline` once, then `npm run benchmark:io:check` to
+   catch I/O regressions (the quick gate defaults to 5% on a quiet machine; pass
+   `-- --max-regression 3` for the strict full-run gate).
+3. On Windows with desktop Excel, run `EXCEL_COM=1 npm run test:excel-com`.
+4. Add or update tests if you change behavior.
+5. Update [CHANGELOG.md](./CHANGELOG.md) for user-visible changes.
 
 Please open an issue or pull request on [GitHub](https://github.com/justybase/justybase_spreadsheet_tasks).
 

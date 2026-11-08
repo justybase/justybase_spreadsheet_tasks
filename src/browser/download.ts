@@ -7,10 +7,15 @@ import { BrowserXlsbWriter } from './BrowserXlsbWriter';
 import { CellValue } from '../Formats';
 
 export { BrowserXlsxWriter } from './BrowserXlsxWriter';
+export type { BrowserSheetOptions, BrowserStartSheetOptions } from './BrowserXlsxWriter';
 export { BrowserXlsbWriter } from './BrowserXlsbWriter';
+export type {
+    BrowserSheetOptions as BrowserXlsbSheetOptions,
+    BrowserStartSheetOptions as BrowserXlsbStartSheetOptions,
+} from './BrowserXlsbWriter';
 export { BrowserBigBuffer } from './BrowserBigBuffer';
 export { BrowserZip } from './BrowserZip';
-export { F, type CellValue, type FormattedCell } from '../Formats';
+export { F, type CellValue, type FormattedCell, type CellStyle, type StyledCell, type FormulaCell, type RichText, type RichTextRun } from '../Formats';
 
 /** Trigger browser download of a Blob */
 function triggerDownload(blob: Blob, fileName: string): void {

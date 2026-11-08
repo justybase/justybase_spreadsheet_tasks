@@ -29,7 +29,7 @@ export class BrowserBigBuffer {
 
     _flush() {
         if (this.cursor > 0) {
-            this.chunks.push(this.currentBuffer.slice(0, this.cursor));
+            this.chunks.push(this.currentBuffer.subarray(0, this.cursor));
             this.currentBuffer = new Uint8Array(this.chunkSize);
             this.dataView = new DataView(this.currentBuffer.buffer);
             this.cursor = 0;
@@ -115,6 +115,23 @@ export class BrowserBigBuffer {
      * @param {string} str
      */
     writeString(str: string) {
+        // Fast path for ASCII markup: no TextEncoder allocation.
+        if (this.cursor + str.length <= this.chunkSize) {
+            let ascii = true;
+            for (let i = 0; i < str.length; i++) {
+                if (str.charCodeAt(i) >= 0x80) {
+                    ascii = false;
+                    break;
+                }
+            }
+            if (ascii) {
+                for (let i = 0; i < str.length; i++) {
+                    this.currentBuffer[this.cursor++] = str.charCodeAt(i);
+                }
+                return;
+            }
+        }
+
         const encoded = this._textEncoder.encode(str);
         const byteLength = encoded.length;
 
@@ -174,12 +191,30 @@ export class BrowserBigBuffer {
      */
     getChunks(): Uint8Array<ArrayBuffer>[] {
         if (this.cursor > 0) {
-            this.chunks.push(this.currentBuffer.slice(0, this.cursor));
+            this.chunks.push(this.currentBuffer.subarray(0, this.cursor));
             this.currentBuffer = new Uint8Array(this.chunkSize);
             this.dataView = new DataView(this.currentBuffer.buffer);
             this.cursor = 0;
         }
         return this.chunks;
+    }
+
+    /** Overwrite a previously written 32-bit integer at an absolute offset. */
+    patchInt32LE(offset: number, value: number): boolean {
+        let position = 0;
+        for (const chunk of this.chunks) {
+            if (offset >= position && offset + 4 <= position + chunk.length) {
+                new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+                    .setInt32(offset - position, value, true);
+                return true;
+            }
+            position += chunk.length;
+        }
+        if (offset >= position && offset + 4 <= position + this.cursor) {
+            this.dataView.setInt32(offset - position, value, true);
+            return true;
+        }
+        return false;
     }
 
     /**

@@ -27,6 +27,7 @@ npm-debug.log*
 # Benchmark results
 benchmark_result*.txt
 benchmark_results_*.txt
+benchmark_results/
 
 # Test output
 tests/output/

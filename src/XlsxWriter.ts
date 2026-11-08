@@ -4,24 +4,50 @@ import { randomUUID } from 'crypto';
 import archiver from 'archiver';
 import { Readable } from 'stream';
 import { BigBuffer } from './BigBuffer';
-import { CellValue, unwrapCell, getFormat } from './Formats';
+import { CellValue, CellStyle } from './Formats';
+import { TextByteSink } from './writers/core/ByteSink';
 import { StreamingSheetState } from './StreamingSheetState';
 import {
     sanitizeSheetName,
     initColWidths,
     applyHeaderWidths,
     updateColWidthsFromRows,
-    defaultColWidth,
+    assertColumnWidth,
     assertCellTextLength,
     assertColumnCount,
     assertRowFitsColumns,
     assertRowCount,
     timeToOaDate,
-    cellRefAttr,
+    AUTOFIT_SAMPLE_ROWS,
+    resolveAutofitRows,
     assertCompressionLevel,
     DEFAULT_COMPRESSION_LEVEL,
 } from './writerHelpers';
 import { columnIndexToLetter } from './xmlUtils';
+import {
+    buildXlsxContentTypes,
+    buildXlsxComments,
+    buildXlsxCommentsVml,
+    buildXlsxRels,
+    buildXlsxSharedStrings,
+    buildXlsxSheetRels,
+    buildXlsxWorkbook,
+    CommentSpec,
+    ConditionalFormatSpec,
+    DataValidationSpec,
+    HyperlinkSpec,
+    SharedStringValue,
+    writeXlsxCell,
+    writeXlsxInlineStringCell,
+    writeXlsxSharedStringCell,
+    writeXlsxSheetHead,
+    writeXlsxSheetTail,
+    XLSX_REL_COMMENTS,
+    XLSX_REL_HYPERLINK,
+    XLSX_REL_VML,
+    XlsxSheetFeatures,
+    XlsxStyleRegistry,
+} from './writers/core/xlsxParts';
 
 interface SheetInfo {
     name: string;
@@ -31,6 +57,26 @@ interface SheetInfo {
     sheetId: number;
     rId: string;
     filterHeaderRange: string | null;
+    merges?: string[];
+    dataValidations?: DataValidationSpec[];
+    conditionalFormats?: ConditionalFormatSpec[];
+    comments?: CommentSpec[];
+    hyperlinks?: Array<{ spec: HyperlinkSpec; rId?: string }>;
+    legacyDrawingRId?: string;
+    sheetRelsXml?: string;
+    extraParts?: Array<{ name: string; data: string }>;
+}
+
+export interface XlsxSheetOptions extends XlsxSheetFeatures {
+    hidden?: boolean;
+    doAutofilter?: boolean;
+    sampleRows?: unknown[][];
+    /** Conservative autofit from headers and the first rows (default true). */
+    autofit?: boolean;
+    /** Rows measured by autofit (default 200); 0 measures only headers/samples. */
+    autofitRows?: number;
+    /** Fixed widths in Excel character units; skips autofit when provided. */
+    columnWidths?: Array<number | null | undefined>;
 }
 
 /**
@@ -46,21 +92,23 @@ export class XlsxWriter {
 
     private sheetCount: number = 0;
     private sheetList: SheetInfo[] = [];
-    private sstArray: string[] = [];
+    private sstArray: SharedStringValue[] = [];
     private sstMap: Map<string, number> = new Map();
+    private readonly _styles = new XlsxStyleRegistry();
     private sstCntAll: number = 0;
     private _autofilterIsOn: boolean = false;
 
     private _oaEpoch: number;
 
-    // Format registry
-    private _formatRegistry: Map<string, number> = new Map();
-    private _formatXfMap: Map<string, number> = new Map();
-    private _nextNumfmtId: number = 165;
-    private _nextXfIndex: number = 4;
+    private readonly _useSharedStrings: boolean;
 
     private readonly stream = new StreamingSheetState();
     private currentColLetters: string[] = [];
+    private _streamPending: BigBuffer | null = null;
+    private _streamHeadFlushed: boolean = true;
+    private _streamHasHeaders: boolean = false;
+    private _streamDataRows: number = 0;
+    private _streamAutofitRows: number = AUTOFIT_SAMPLE_ROWS;
 
     /**
      * @param filePath Destination `.xlsx` path on disk.
@@ -69,8 +117,9 @@ export class XlsxWriter {
      * @param filePath Destination `.xlsx` path on disk.
      * @param options.compressionLevel Deflate level 0-9 (default 3).
      */
-    constructor(filePath: string, options: { compressionLevel?: number } = {}) {
+    constructor(filePath: string, options: { compressionLevel?: number; useSharedStrings?: boolean } = {}) {
         const compressionLevel = assertCompressionLevel(options.compressionLevel ?? DEFAULT_COMPRESSION_LEVEL);
+        this._useSharedStrings = options.useSharedStrings !== false;
         this._targetPath = path.resolve(filePath);
         fs.mkdirSync(path.dirname(this._targetPath), { recursive: true });
         this._tempPath = path.join(
@@ -96,23 +145,6 @@ export class XlsxWriter {
         return sanitizeSheetName(name, this.sheetCount);
     }
 
-    private _escapeSheetNameForXml(name: string): string {
-        return name
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&apos;');
-    }
-
-    private _formatSheetNameForFormula(name: string): string {
-        if (/[\s\-+=()!@#$%^&]/.test(name) || /^[0-9]/.test(name)) {
-            const escaped = name.replace(/'/g, "''");
-            return `'${escaped}'`;
-        }
-        return name;
-    }
-
     /**
      * Register a worksheet (metadata only). Prefer `writeSheet` / `startSheet` for data.
      */
@@ -133,42 +165,105 @@ export class XlsxWriter {
         });
     }
 
-    private _needsEscape(str: string): boolean {
-        for (let i = 0; i < str.length; i++) {
-            const c = str.charCodeAt(i);
-            if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || c === 13 ||
-                (c >= 0 && c <= 8) || c === 11 || c === 12 || (c >= 14 && c <= 31)) {
-                return true;
+    /**
+     * Resolve column widths with the conservative autofit: header text and up
+     * to 200 sample rows, calibrated character costs plus padding, capped at
+     * 200. Fixed `columnWidths` win over autofit.
+     */
+    private _resolveColumnWidths(
+        columnCount: number,
+        headers: string[] | null | undefined,
+        rows: unknown[][] | undefined,
+        options: XlsxSheetOptions,
+        doAutofilter: boolean,
+    ): number[] {
+        const widths = initColWidths(columnCount);
+        if (options.columnWidths) {
+            for (let i = 0; i < columnCount; i++) {
+                const width = options.columnWidths[i];
+                if (width !== null && width !== undefined) widths[i] = assertColumnWidth(width, i);
+            }
+            return widths;
+        }
+        if (options.autofit === false) return widths;
+        if (headers) {
+            applyHeaderWidths(widths, headers, columnCount, {
+                bold: true,
+                filterButton: doAutofilter,
+            });
+        }
+        const samples = options.sampleRows ?? rows;
+        const limit = options.sampleRows
+            ? samples?.length ?? 0
+            : resolveAutofitRows(options.autofitRows);
+        if (samples && limit > 0) updateColWidthsFromRows(widths, samples, limit);
+        return widths;
+    }
+
+    /** Store sheet features and build the worksheet rels/comments parts. */
+    private _applySheetFeatures(sheet: SheetInfo, features: XlsxSheetFeatures): void {
+        if (features.merges) sheet.merges = features.merges;
+        if (features.dataValidations) sheet.dataValidations = features.dataValidations;
+        if (features.conditionalFormats) sheet.conditionalFormats = features.conditionalFormats;
+
+        const rels: Array<{ id: string; type: string; target: string; external?: boolean }> = [];
+        let nextRelId = 1;
+        const hyperlinks: Array<{ spec: HyperlinkSpec; rId?: string }> = [];
+        for (const spec of features.hyperlinks ?? []) {
+            if (spec.target) {
+                const id = `rId${nextRelId++}`;
+                rels.push({ id, type: XLSX_REL_HYPERLINK, target: spec.target, external: true });
+                hyperlinks.push({ spec, rId: id });
+            } else {
+                hyperlinks.push({ spec });
             }
         }
-        return false;
+        if (hyperlinks.length > 0) sheet.hyperlinks = hyperlinks;
+
+        const comments = features.comments ?? [];
+        if (comments.length > 0) {
+            const commentsPath = `xl/comments/sheet${sheet.sheetId}.xml`;
+            const vmlPath = `xl/drawings/commentsDrawing${sheet.sheetId}.vml`;
+            const commentsRid = `rId${nextRelId++}`;
+            const vmlRid = `rId${nextRelId++}`;
+            rels.push({
+                id: commentsRid,
+                type: XLSX_REL_COMMENTS,
+                target: `../comments/sheet${sheet.sheetId}.xml`,
+            });
+            rels.push({
+                id: vmlRid,
+                type: XLSX_REL_VML,
+                target: `../drawings/commentsDrawing${sheet.sheetId}.vml`,
+            });
+            sheet.comments = comments;
+            sheet.legacyDrawingRId = vmlRid;
+            sheet.extraParts = [
+                { name: commentsPath, data: buildXlsxComments(comments) },
+                { name: vmlPath, data: buildXlsxCommentsVml(comments) },
+            ];
+        }
+
+        if (rels.length > 0) sheet.sheetRelsXml = buildXlsxSheetRels(rels);
     }
 
-    private _escape(str: string): string {
-        if (typeof str !== 'string') return str;
-        // Literal `_xHHHH_` is written as `_x005F_xHHHH_` so Excel does not decode it (ST_Xstring).
-        str = str.replace(/_x([0-9A-Fa-f]{4})_/g, '_x005F_x$1_');
-        if (!this._needsEscape(str)) return str;
-
-        return str.replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&apos;')
-            // CR must be a character reference: raw CR is normalized to LF by XML parsers.
-            .replace(/\r/g, '&#13;')
-            // eslint-disable-next-line no-control-regex
-            .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+    private _appendExtraParts(sheet: SheetInfo): void {
+        if (sheet.sheetRelsXml) {
+            this.archive.append(sheet.sheetRelsXml, {
+                name: `xl/worksheets/_rels/${sheet.nameInArchive}.rels`,
+            });
+        }
+        for (const part of sheet.extraParts ?? []) {
+            this.archive.append(part.data, { name: part.name });
+        }
     }
 
-    /**
-     * Start streaming a sheet. Call `writeRow` for each row, then `endSheet`.
-     */
+
     startSheet(
         sheetName: string,
         columnCount: number,
         headers?: string[],
-        options: { hidden?: boolean; doAutofilter?: boolean; sampleRows?: unknown[][] } = {}
+        options: XlsxSheetOptions = {}
     ): void {
         assertColumnCount(columnCount);
         if (headers !== undefined) {
@@ -176,12 +271,13 @@ export class XlsxWriter {
             for (const h of headers) assertCellTextLength(h);
         }
 
-        const { hidden = false, doAutofilter = true, sampleRows } = options;
+        const { hidden = false, doAutofilter = true } = options;
 
         this.addSheet(sheetName, hidden);
+        const sheet = this.sheetList[this.sheetCount - 1];
+        this._applySheetFeatures(sheet, options);
 
         this.stream.begin(columnCount, doAutofilter && headers !== undefined, new BigBuffer());
-        const bigBuf = this.stream.buffer!;
 
         const colLetters = new Array(columnCount);
         for (let i = 0; i < columnCount; i++) {
@@ -189,50 +285,73 @@ export class XlsxWriter {
         }
         this.currentColLetters = colLetters;
 
-        if (headers) {
-            applyHeaderWidths(this.stream.colWidths, headers, columnCount);
-        }
-        if (sampleRows) {
-            updateColWidthsFromRows(this.stream.colWidths, sampleRows);
-        }
+        this.stream.colWidths = this._resolveColumnWidths(
+            columnCount,
+            headers,
+            undefined,
+            options,
+            doAutofilter && headers !== undefined,
+        );
 
-        bigBuf.writeString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
-        bigBuf.writeString('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">');
-
-        // Dimension - just A1 since we don't know row count in advance
-        bigBuf.writeString('<dimension ref="A1"/>');
-
-        const isFirstSheet = this.sheetCount === 1;
-        if (headers) {
-            if (isFirstSheet) {
-                bigBuf.writeString('<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" /><selection pane="bottomLeft" /></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            } else {
-                bigBuf.writeString('<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" /><selection pane="bottomLeft" /></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            }
-        } else {
-            if (isFirstSheet) {
-                bigBuf.writeString('<sheetViews><sheetView tabSelected="1" workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            } else {
-                bigBuf.writeString('<sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            }
-        }
-
-        bigBuf.writeString('<cols>');
-        for (let i = 0; i < columnCount; i++) {
-            const width = defaultColWidth(this.stream.colWidths[i]);
-            bigBuf.writeString(`<col min="${i + 1}" max="${i + 1}" width="${width}" bestFit="1" customWidth="1" />`);
-        }
-        bigBuf.writeString('</cols><sheetData>');
+        // Widths come from the header and the first AUTOFIT_SAMPLE_ROWS data
+        // rows, so the sheet head is delayed until they are measured (xlspy
+        // behaves the same way). Until then rows are buffered here.
+        this._streamHasHeaders = headers !== undefined;
+        this._streamDataRows = 0;
+        this._streamAutofitRows = resolveAutofitRows(options.autofitRows);
+        this._streamHeadFlushed = false;
+        this._streamPending = new BigBuffer();
 
         if (headers) {
             this.stream.rowNum++;
-            bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
+            const pending = this._streamPending;
+            pending.writeString(`<row r="${this.stream.rowNum}">`);
             // Headers are contiguous from column A, so no cell needs `r`.
             for (let c = 0; c < headers.length; c++) {
-                this._writeStringCell(bigBuf, headers[c], '', 3);
+                this._writeStringCell(pending, headers[c], '', 3);
             }
-            bigBuf.writeString('</row>');
+            pending.writeString('</row>');
         }
+        if (this._streamAutofitRows === 0) this._flushStreamHead();
+    }
+
+    /** Write the delayed sheet head and everything buffered before it. */
+    private _flushStreamHead(): void {
+        if (this._streamHeadFlushed) return;
+        const bigBuf = this.stream.assertStreaming();
+        const pending = this._streamPending;
+        writeXlsxSheetHead(bigBuf, {
+            dimensionRef: 'A1',
+            columnCount: this.stream.endCol,
+            isFirstSheet: this.sheetCount === 1,
+            hasHeaders: this._streamHasHeaders,
+            colWidths: this.stream.colWidths,
+        });
+        if (pending) {
+            for (const chunk of pending.getChunks()) bigBuf.write(chunk);
+        }
+        this._streamPending = null;
+        this._streamHeadFlushed = true;
+    }
+
+    private _writeStreamRow(bigBuf: BigBuffer, row: CellValue[]): void {
+        this.stream.rowNum++;
+        assertRowCount(this.stream.rowNum);
+        bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
+
+        let prevCol = -1;
+        for (let c = 0; c < row.length; c++) {
+            prevCol = writeXlsxCell(
+                bigBuf,
+                this,
+                row[c],
+                c,
+                prevCol,
+                this.currentColLetters[c],
+                this.stream.rowNum,
+            );
+        }
+        bigBuf.writeString('</row>');
     }
 
     /** Write one data row in streaming mode. */
@@ -245,76 +364,78 @@ export class XlsxWriter {
             );
         }
 
-        this.stream.rowNum++;
-        assertRowCount(this.stream.rowNum);
-        bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
-
-        let prevCol = -1;
-        for (let c = 0; c < row.length; c++) {
-            const raw = row[c];
-            if (raw === null || raw === undefined) continue;
-
-            const fmtString = getFormat(raw);
-            const val = fmtString !== null ? unwrapCell(raw) : raw;
-            const xfIdx = fmtString !== null ? this._registerFormat(fmtString) : -1;
-            const styleAttr = xfIdx >= 0 ? ` s="${xfIdx}"` : '';
-
-            const ref = cellRefAttr(c, prevCol, this.currentColLetters[c], this.stream.rowNum);
-            prevCol = c;
-            if (typeof val === 'number') {
-                if (Number.isFinite(val)) {
-                    bigBuf.writeString(`<c${ref}${styleAttr}><v>${val}</v></c>`);
-                } else {
-                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-                }
-            } else if (typeof val === 'bigint') {
-                this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-            } else if (typeof val === 'boolean') {
-                bigBuf.writeString(`<c${ref} t="b"${styleAttr}><v>${val ? 1 : 0}</v></c>`);
-            } else if (val instanceof Date) {
-                const oaDate = this._toOADate(val);
-                if (Number.isFinite(oaDate)) {
-                    const finalStyle = xfIdx >= 0 ? xfIdx : 1;
-                    bigBuf.writeString(`<c${ref} s="${finalStyle}"><v>${oaDate}</v></c>`);
-                } else {
-                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-                }
-            } else if (val !== null && val !== undefined) {
-                this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-            }
+        if (!this._streamHeadFlushed && this._streamPending) {
+            this._streamDataRows++;
+            updateColWidthsFromRows(this.stream.colWidths, [row]);
+            this._writeStreamRow(this._streamPending, row);
+            if (this._streamDataRows >= this._streamAutofitRows) this._flushStreamHead();
+            return;
         }
-        bigBuf.writeString('</row>');
+        this._writeStreamRow(bigBuf, row);
     }
 
     /** Finish the current streaming sheet and append it to the archive. */
     endSheet(): void {
+        this._flushStreamHead();
         const bigBuf = this.stream.assertStreaming();
-        bigBuf.writeString('</sheetData>');
-
-        if (this.stream.doAutofilter && this.stream.endCol > 0) {
+        const sheet = this.sheetList[this.sheetCount - 1];
+        const filterRange = writeXlsxSheetTail(bigBuf, {
+            doAutofilter: this.stream.doAutofilter,
+            columnCount: this.stream.endCol,
+            lastColumnLetter: this.currentColLetters[this.stream.endCol - 1] ?? 'A',
+            rowNum: this.stream.rowNum,
+            sheetName: sheet.name,
+            merges: sheet.merges,
+            hyperlinks: sheet.hyperlinks,
+            dataValidations: sheet.dataValidations,
+            conditionalFormats: sheet.conditionalFormats,
+            legacyDrawingRId: sheet.legacyDrawingRId,
+            registerDxf: style => this._styles.registerDxf(style),
+        });
+        if (filterRange !== null) {
             this._autofilterIsOn = true;
-            const filterRef = `A1:${this.currentColLetters[this.stream.endCol - 1]}${this.stream.rowNum}`;
-            bigBuf.writeString(`<autoFilter ref="${filterRef}"/>`);
-
-            const sheet = this.sheetList[this.sheetCount - 1];
-            const formulaSheetName = this._formatSheetNameForFormula(sheet.name);
-            sheet.filterHeaderRange = `${formulaSheetName}!$A$1:$${this.currentColLetters[this.stream.endCol - 1]}$${this.stream.rowNum}`;
+            sheet.filterHeaderRange = filterRange;
         }
 
-        bigBuf.writeString('</worksheet>');
-
         this.archive.append(Readable.from(bigBuf.getChunks()), {
-            name: this.sheetList[this.sheetCount - 1].pathInArchive
+            name: sheet.pathInArchive
         });
+        this._appendExtraParts(sheet);
 
         this.stream.end();
         this.currentColLetters = [];
+        this._streamPending = null;
+        this._streamHeadFlushed = true;
+        this._streamHasHeaders = false;
+        this._streamDataRows = 0;
+        this._streamAutofitRows = AUTOFIT_SAMPLE_ROWS;
     }
 
     /**
      * Write an entire sheet in one call (batch mode).
+     *
+     * The third argument keeps the legacy `doAutofilter` boolean; pass
+     * {@link XlsxSheetOptions} instead to add features (merges, hyperlinks,
+     * validations, conditional formats, comments) and width control.
      */
-    writeSheet(rows: CellValue[][], headers: string[] | null = null, doAutofilter: boolean = true): void {
+    writeSheet(
+        rows: CellValue[][],
+        headers: string[] | null = null,
+        doAutofilterOrOptions: boolean | XlsxSheetOptions = true,
+        extraOptions: XlsxSheetOptions = {},
+    ): void {
+        let doAutofilter = true;
+        let options: XlsxSheetOptions;
+        if (typeof doAutofilterOrOptions === 'boolean') {
+            // The options object is the newer API; an explicit `doAutofilter`
+            // there wins over the legacy positional boolean.
+            doAutofilter = extraOptions.doAutofilter ?? doAutofilterOrOptions;
+            options = { ...extraOptions, doAutofilter };
+        } else {
+            options = { ...doAutofilterOrOptions, ...extraOptions };
+            doAutofilter = options.doAutofilter !== false;
+        }
+
         const bigBuf = new BigBuffer();
 
         let columnCount = 0;
@@ -335,48 +456,29 @@ export class XlsxWriter {
             assertRowFitsColumns('row', rows[r].length, columnCount);
         }
 
-        const colWidths = initColWidths(columnCount);
-
         const colLetters = new Array(columnCount);
         for (let i = 0; i < columnCount; i++) {
             colLetters[i] = this._getColumnLetter(i);
         }
 
-        if (headers) {
-            applyHeaderWidths(colWidths, headers, columnCount);
-        }
-        updateColWidthsFromRows(colWidths, rows);
+        const colWidths = this._resolveColumnWidths(
+            columnCount,
+            headers,
+            rows,
+            options,
+            doAutofilter && headers !== null && headers !== undefined,
+        );
 
-        bigBuf.writeString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
-        bigBuf.writeString('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">');
-
-        if (totalRows > 0 && columnCount > 0) {
-            bigBuf.writeString(`<dimension ref="A1:${colLetters[columnCount - 1]}${totalRows}"/>`);
-        } else {
-            bigBuf.writeString('<dimension ref="A1"/>');
-        }
-
-        const isFirstSheet = this.sheetCount === 1;
-        if (headers) {
-            if (isFirstSheet) {
-                bigBuf.writeString('<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" /><selection pane="bottomLeft" /></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            } else {
-                bigBuf.writeString('<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" /><selection pane="bottomLeft" /></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            }
-        } else {
-            if (isFirstSheet) {
-                bigBuf.writeString('<sheetViews><sheetView tabSelected="1" workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            } else {
-                bigBuf.writeString('<sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
-            }
-        }
-
-        bigBuf.writeString('<cols>');
-        for (let i = 0; i < columnCount; i++) {
-            const width = defaultColWidth(colWidths[i]);
-            bigBuf.writeString(`<col min="${i + 1}" max="${i + 1}" width="${width}" bestFit="1" customWidth="1" />`);
-        }
-        bigBuf.writeString('</cols><sheetData>');
+        const dimensionRef = totalRows > 0 && columnCount > 0
+            ? `A1:${colLetters[columnCount - 1]}${totalRows}`
+            : 'A1';
+        writeXlsxSheetHead(bigBuf, {
+            dimensionRef,
+            columnCount,
+            isFirstSheet: this.sheetCount === 1,
+            hasHeaders: headers !== null && headers !== undefined,
+            colWidths,
+        });
 
         let rowNum = 0;
 
@@ -396,93 +498,73 @@ export class XlsxWriter {
             const row = rows[r];
             let prevCol = -1;
             for (let c = 0; c < row.length; c++) {
-                const raw = row[c];
-                if (raw === null || raw === undefined) continue;
-
-                const fmtString = getFormat(raw);
-                const val = fmtString !== null ? unwrapCell(raw) : raw;
-                const xfIdx = fmtString !== null ? this._registerFormat(fmtString) : -1;
-                const styleAttr = xfIdx >= 0 ? ` s="${xfIdx}"` : '';
-
-                const ref = cellRefAttr(c, prevCol, colLetters[c], rowNum);
-                prevCol = c;
-                if (typeof val === 'number') {
-                    if (Number.isFinite(val)) {
-                        bigBuf.writeString(`<c${ref}${styleAttr}><v>${val}</v></c>`);
-                    } else {
-                        this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-                    }
-                } else if (typeof val === 'bigint') {
-                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-                } else if (typeof val === 'boolean') {
-                    bigBuf.writeString(`<c${ref} t="b"${styleAttr}><v>${val ? 1 : 0}</v></c>`);
-                } else if (val instanceof Date) {
-                    const oaDate = this._toOADate(val);
-                    if (Number.isFinite(oaDate)) {
-                        const finalStyle = xfIdx >= 0 ? xfIdx : 1;
-                        bigBuf.writeString(`<c${ref} s="${finalStyle}"><v>${oaDate}</v></c>`);
-                    } else {
-                        this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-                    }
-                } else if (val !== null && val !== undefined) {
-                    this._writeStringCell(bigBuf, val.toString(), ref, xfIdx >= 0 ? xfIdx : undefined);
-                }
+                prevCol = writeXlsxCell(bigBuf, this, row[c], c, prevCol, colLetters[c], rowNum);
             }
             bigBuf.writeString('</row>');
         }
 
-        bigBuf.writeString('</sheetData>');
+        const sheet = this.sheetList[this.sheetCount - 1];
+        if (!sheet) {
+            throw new Error('Call addSheet() before writeSheet()');
+        }
+        this._applySheetFeatures(sheet, options);
 
-        if (doAutofilter && headers && columnCount > 0) {
+        const filterRange = writeXlsxSheetTail(bigBuf, {
+            doAutofilter: doAutofilter && headers !== null && headers !== undefined,
+            columnCount,
+            lastColumnLetter: columnCount > 0 ? colLetters[columnCount - 1] : 'A',
+            rowNum: totalRows,
+            sheetName: sheet.name,
+            merges: sheet.merges,
+            hyperlinks: sheet.hyperlinks,
+            dataValidations: sheet.dataValidations,
+            conditionalFormats: sheet.conditionalFormats,
+            legacyDrawingRId: sheet.legacyDrawingRId,
+            registerDxf: style => this._styles.registerDxf(style),
+        });
+        if (filterRange !== null) {
             this._autofilterIsOn = true;
-            const filterRef = `A1:${colLetters[columnCount - 1]}${totalRows}`;
-            bigBuf.writeString(`<autoFilter ref="${filterRef}"/>`);
-
-            const sheet = this.sheetList[this.sheetCount - 1];
-            const formulaSheetName = this._formatSheetNameForFormula(sheet.name);
-            sheet.filterHeaderRange = `${formulaSheetName}!$A$1:$${colLetters[columnCount - 1]}$${totalRows}`;
+            sheet.filterHeaderRange = filterRange;
         }
 
-        bigBuf.writeString('</worksheet>');
-
         this.archive.append(Readable.from(bigBuf.getChunks()), {
-            name: this.sheetList[this.sheetCount - 1].pathInArchive
+            name: sheet.pathInArchive
         });
+        this._appendExtraParts(sheet);
     }
 
     /** `ref` is the cell's `r` attribute from `cellRefAttr`, or '' when omitted. */
-    private _writeStringCell(bigBuf: BigBuffer, val: string, ref: string, styleOverride?: number): void {
-        assertCellTextLength(val);
-        let index = this.sstMap.get(val);
-        if (index === undefined) {
-            index = this.sstArray.length;
-            this.sstArray.push(val);
-            this.sstMap.set(val, index);
+    private _writeStringCell(bigBuf: TextByteSink, val: SharedStringValue, ref: string, styleOverride?: number): void {
+        assertCellTextLength(typeof val === 'string' ? val : val.toString());
+        if (this._useSharedStrings) {
+            writeXlsxSharedStringCell(bigBuf, { values: this.sstArray, index: this.sstMap }, val, ref, styleOverride);
+            this.sstCntAll++;
+            return;
         }
-        this.sstCntAll++;
-        const styleAttr = styleOverride !== undefined ? ` s="${styleOverride}"` : '';
-        bigBuf.writeString(`<c${ref} t="s"${styleAttr}><v>${index}</v></c>`);
+        writeXlsxInlineStringCell(bigBuf, val, ref, styleOverride);
     }
 
-    private _registerFormat(fmtString: string): number {
-        if (this._formatXfMap.has(fmtString)) {
-            return this._formatXfMap.get(fmtString)!;
-        }
-        const numfmtId = this._nextNumfmtId++;
-        this._formatRegistry.set(fmtString, numfmtId);
-        const xfIndex = this._nextXfIndex++;
-        this._formatXfMap.set(fmtString, xfIndex);
-        return xfIndex;
+    // XlsxCellContext implementation used by the shared cell writer.
+    writeStringCell(bigBuf: TextByteSink, val: SharedStringValue, ref: string, styleOverride?: number): void {
+        this._writeStringCell(bigBuf, val, ref, styleOverride);
+    }
+
+    registerStyle(style: CellStyle): number {
+        return this._styles.register(style);
+    }
+
+    registerFormat(fmtString: string): number {
+        return this._styles.registerFormat(fmtString);
+    }
+
+    toOaDate(date: Date): number {
+        return this._toOADate(date);
     }
 
     private _toOADate(date: Date): number {
         // Use UTC time to avoid timezone conversion issues; handles the
         // fictitious 1900-02-29 (dates before 1900-03-01 serialize one lower).
         return timeToOaDate(date.getTime(), this._oaEpoch);
-    }
-
-    private _getDateWidth(_date: Date): number {
-        return 19; // "YYYY-MM-DD HH:MM:SS" ≈ 19 chars
     }
 
     /** Finalize the ZIP package and close the output stream. */
@@ -555,155 +637,37 @@ export class XlsxWriter {
     }
 
     private _writeSharedStrings(): void {
-        const bigBuf = new BigBuffer();
-
-        bigBuf.writeString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
-        bigBuf.writeString(`<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${this.sstCntAll}" uniqueCount="${this.sstArray.length}">`);
-
-        for (let i = 0; i < this.sstArray.length; i++) {
-            const txt = this.sstArray[i];
-            const cleanTxt = this._escape(txt);
-            if (cleanTxt.length > 0 && (cleanTxt[0] === ' ' || cleanTxt[cleanTxt.length - 1] === ' ' || /[\t\n\r]/.test(cleanTxt))) {
-                bigBuf.writeString(`<si><t xml:space="preserve">${cleanTxt}</t></si>`);
-            } else {
-                bigBuf.writeString(`<si><t>${cleanTxt}</t></si>`);
-            }
-        }
-
-        bigBuf.writeString('</sst>');
-
-        this.archive.append(Readable.from(bigBuf.getChunks()), { name: 'xl/sharedStrings.xml' });
+        this.archive.append(
+            buildXlsxSharedStrings(this.sstArray, this.sstCntAll),
+            { name: 'xl/sharedStrings.xml' },
+        );
     }
 
     private _writeStyles(): void {
-        let numFmts = '';
-        let numFmtCount = 0;
-
-        const xfEntries: string[] = [];
-        xfEntries.push('<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>');
-        xfEntries.push('<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>');
-        xfEntries.push('<xf numFmtId="22" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>');
-        xfEntries.push('<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>');
-
-        for (const [fmtString, numfmtId] of this._formatRegistry) {
-            const escapedFmt = fmtString
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&apos;');
-            numFmts += `<numFmt numFmtId="${numfmtId}" formatCode="${escapedFmt}"/>`;
-            numFmtCount++;
-        }
-
-        const sortedFormats = [...this._formatXfMap.entries()].sort((a, b) => a[1] - b[1]);
-        for (const [fmtString] of sortedFormats) {
-            const numfmtId = this._formatRegistry.get(fmtString)!;
-            xfEntries.push(`<xf numFmtId="${numfmtId}" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`);
-        }
-
-        const totalXf = xfEntries.length;
-        const numFmtsSection = numFmtCount > 0 ? `<numFmts count="${numFmtCount}">${numFmts}</numFmts>` : '';
-
-        const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-${numFmtsSection}
-<fonts count="2">
-<font><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/><scheme val="minor"/></font>
-<font><b/><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/><scheme val="minor"/></font>
-</fonts>
-<fills count="2">
-<fill><patternFill patternType="none"/></fill>
-<fill><patternFill patternType="gray125"/></fill>
-</fills>
-<borders count="1">
-<border><left/><right/><top/><bottom/><diagonal/></border>
-</borders>
-<cellStyleXfs count="1">
-<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
-</cellStyleXfs>
-<cellXfs count="${totalXf}">
-${xfEntries.join('\n')}
-</cellXfs>
-<cellStyles count="1">
-<cellStyle name="Normal" xfId="0" builtinId="0"/>
-</cellStyles>
-<dxfs count="0"/>
-<tableStyles count="0" defaultTableStyle="TableStyleMedium2" defaultPivotStyle="PivotStyleLight16"/>
-</styleSheet>`;
-        this.archive.append(styles, { name: 'xl/styles.xml' });
+        this.archive.append(this._styles.toXml(), { name: 'xl/styles.xml' });
     }
 
     private _writeWorkbook(): void {
-        let xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<fileVersion appName="xl" lastEdited="4" lowestEdited="4" rupBuild="4505"/>
-<workbookPr defaultThemeVersion="124226"/>
-<bookViews><workbookView xWindow="240" yWindow="15" windowWidth="16095" windowHeight="9660"/></bookViews>
-<sheets>`;
-
-        for (const sheet of this.sheetList) {
-            const state = sheet.hidden ? ' state="hidden"' : '';
-            const escapedName = this._escapeSheetNameForXml(sheet.name);
-            xml += `<sheet name="${escapedName}" sheetId="${sheet.sheetId}"${state} r:id="${sheet.rId}"/>`;
-        }
-
-        xml += `</sheets>`;
-
-        if (this._autofilterIsOn) {
-            xml += '<definedNames>';
-            for (const sheet of this.sheetList) {
-                if (sheet.filterHeaderRange) {
-                    const localSheetId = sheet.sheetId - 1;
-                    const escapedRange = this._escape(sheet.filterHeaderRange);
-                    xml += `<definedName name="_xlnm._FilterDatabase" localSheetId="${localSheetId}" hidden="1">${escapedRange}</definedName>`;
-                }
-            }
-            xml += '</definedNames>';
-        }
-
-        xml += '<calcPr calcId="124519" fullCalcOnLoad="1"/>';
-        xml += `</workbook>`;
-        this.archive.append(xml, { name: 'xl/workbook.xml' });
+        this.archive.append(
+            buildXlsxWorkbook(this.sheetList, this._autofilterIsOn),
+            { name: 'xl/workbook.xml' },
+        );
     }
 
     private _writeContentTypes(): void {
-        let xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
-<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>`;
-
-        for (const sheet of this.sheetList) {
-            xml += `<Override PartName="/${sheet.pathInArchive}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
-        }
-
-        xml += `</Types>`;
-        this.archive.append(xml, { name: '[Content_Types].xml' });
+        const commentParts = this.sheetList
+            .filter(sheet => (sheet.comments?.length ?? 0) > 0)
+            .map(sheet => ({ path: `xl/comments/sheet${sheet.sheetId}.xml` }));
+        this.archive.append(
+            buildXlsxContentTypes(this.sheetList, commentParts),
+            { name: '[Content_Types].xml' },
+        );
     }
 
     private _writeRels(): void {
-        const globalRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>`;
-        this.archive.append(globalRels, { name: '_rels/.rels' });
-
-        let wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`;
-
-        for (const sheet of this.sheetList) {
-            wbRels += `<Relationship Id="${sheet.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/${sheet.nameInArchive}"/>`;
-        }
-
-        let nextId = this.sheetList.length + 1;
-        wbRels += `<Relationship Id="rId${nextId++}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`;
-        wbRels += `<Relationship Id="rId${nextId++}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>`;
-
-        wbRels += `</Relationships>`;
-        this.archive.append(wbRels, { name: 'xl/_rels/workbook.xml.rels' });
+        const rels = buildXlsxRels(this.sheetList);
+        this.archive.append(rels.global, { name: '_rels/.rels' });
+        this.archive.append(rels.workbook, { name: 'xl/_rels/workbook.xml.rels' });
     }
 }
 

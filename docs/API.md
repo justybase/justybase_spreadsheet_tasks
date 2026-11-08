@@ -4,6 +4,7 @@
 
 - [XlsbWriter](#xlsbwriter)
 - [XlsxWriter](#xlsxwriter)
+- [Styles, formulas and sheet features](#styles-formulas-and-sheet-features)
 - [XlsbReader](#xlsbreader)
 - [XlsxReader](#xlsxreader)
 - [XlsxUpdater](#xlsxupdater)
@@ -49,14 +50,21 @@ writer.addSheet('Sales Data');
 writer.addSheet('Hidden Sheet', true);
 ```
 
-#### `writeSheet(rows: any[][], headers?: string[] | null, doAutofilter?: boolean): void`
+#### `writeSheet(rows: any[][], headers?: string[] | null, options?: boolean | XlsbSheetOptions): void`
 
 Writes data to the current sheet.
 
 **Parameters:**
-- `rows` - 2D array of data to write
-- `headers` - Optional. Array of header strings (if not provided, first row is used as headers)
-- `doAutofilter` - Optional. If `true`, adds autofilter to headers (default: `true`)
+- `rows` - 2D array of data to write (`CellValue`, including styles and formulas)
+- `headers` - Optional. Array of header strings
+- `doAutofilter` - Optional legacy boolean; pass `XlsbSheetOptions` instead for features and widths
+- `options.merges` - Merged ranges, e.g. `['A4:B4']`
+- `options.hyperlinks` - `{ ref, target?, location?, tooltip?, display? }[]`
+- `options.dataValidations` - List, whole/decimal/date/time/text-length/custom rules
+- `options.columnWidths` - Fixed widths in Excel character units; skips autofit
+- `options.autofit` - Set `false` to disable the conservative width heuristic
+- `options.autofitRows` - Rows measured by autofit (default 200; `0` uses headers/samples only)
+- `options.sampleRows` - Extra rows used by autofit in streaming mode
 
 **Supported Data Types:**
 - `string` - Written as shared string
@@ -64,8 +72,12 @@ Writes data to the current sheet.
 - `boolean` - Written as boolean
 - `Date` - Written as Excel date serial number. The serial is taken from the UTC
   time (`getTime()`), not local wall-clock time: `new Date(2024, 5, 30)` in UTC+2
-  is stored as 2024-06-29 22:00 and shows that way in Excel. Use `Date.UTC(...)`
-  for date-only values
+  is stored as 2024-06-29 22:00 and shows that way in Excel. Dates with a UTC
+  time of day use the datetime number format (`m/d/yy h:mm`); midnight uses the
+  date format. Use `Date.UTC(...)` for date-only values
+- `FormattedCell` - Legacy `{ value, format }` number format
+- `StyledCell` - `{ value, style }` with font/fill/border/alignment/protection/number format
+- `FormulaCell` - `{ formula, value?, style? }`; `value` is the cached result
 - `null` / `undefined` - Written as empty cell
 
 **Example:**
@@ -108,8 +120,102 @@ new XlsxWriter(filePath: string)
 
 All methods are identical to [XlsbWriter](#xlsbwriter):
 - `addSheet(sheetName: string, hidden?: boolean): void`
-- `writeSheet(rows: any[][], headers?: string[] | null, doAutofilter?: boolean): void`
+- `writeSheet(rows: any[][], headers?: string[] | null, options?: boolean | XlsxSheetOptions): void`
 - `finalize(): Promise<void>`
+
+---
+
+## Styles, formulas and sheet features
+
+### `CellStyle`
+
+```typescript
+interface CellStyle {
+    numFmt?: string;
+    font?: { name?: string; size?: number; bold?: boolean; italic?: boolean;
+             underline?: 'single' | 'double' | 'singleAccounting' | 'doubleAccounting' | boolean;
+             strike?: boolean; color?: StyleColor; family?: number;
+             scheme?: 'major' | 'minor'; vertAlign?: 'baseline' | 'superscript' | 'subscript';
+             outline?: boolean; shadow?: boolean; condense?: boolean; extend?: boolean; charset?: number };
+    fill?: { patternType?: PatternType; fgColor?: StyleColor; bgColor?: StyleColor };
+    border?: { top?: BorderSide; bottom?: BorderSide; left?: BorderSide; right?: BorderSide;
+               diagonal?: BorderSide; diagonalUp?: boolean; diagonalDown?: boolean; outline?: boolean };
+    alignment?: { horizontal?: ...; vertical?: ...; wrapText?: boolean; shrinkToFit?: boolean;
+                  indent?: number; textRotation?: number; justifyLastLine?: boolean; readingOrder?: 0 | 1 | 2 };
+    protection?: { locked?: boolean; hidden?: boolean };
+}
+```
+
+`StyleColor` is `RRGGBB`, `AARRGGBB`, `#RRGGBB`, `{ indexed }` or `{ theme, tint? }`.
+
+### `StyledCell`, `FormulaCell` and `RichText`
+
+```typescript
+{ value: 10, style: { font: { bold: true }, fill: { fgColor: 'FFFF00' } } }
+{ formula: 'SUM(A2:A3)', value: 30, style: { numFmt: '#,##0.00' } }
+new RichText([
+    { text: 'red', style: { font: { color: 'FF0000' } } },
+    { text: ' plain' },
+])
+```
+
+`FormattedCell` (`{ value, format }`) remains supported; it is equivalent to
+`{ value, style: { numFmt: format } }`.
+
+### `XlsxSheetOptions`
+
+```typescript
+interface XlsxSheetOptions {
+    merges?: string[];
+    hyperlinks?: Array<{ ref: string; target?: string; location?: string; tooltip?: string; display?: string }>;
+    dataValidations?: DataValidationSpec[];
+    conditionalFormats?: ConditionalFormatSpec[];
+    comments?: Array<{ ref: string; text: string; author?: string }>;
+    columnWidths?: Array<number | null | undefined>;
+    autofit?: boolean;
+    autofitRows?: number;
+    sampleRows?: unknown[][];
+}
+```
+
+XLSB accepts the same options except `conditionalFormats` and `comments`, which
+throw a clear error because the XLSB writer does not emit those parts yet.
+XLSB rich text is also XLSX-only.
+
+### Column autofit
+
+When `columnWidths` is omitted and `autofit` is not `false`, widths are estimated
+from the header and up to 200 sample rows (xlspy measures up to 1000) using
+conservative per-character costs. The estimate accounts for CJK/fullwidth
+characters, emoji, bold/italic text, font size, wide font families, common
+number/date formats, alignment indent, the longest line of wrapped text and
+negative number-format sections. It is clamped to Excel's 8.43 minimum,
+reserves room for the autofilter drop-down, adds the 5/7-character cell padding
+when written, and caps the stored width at 200. The widths are deliberately
+biased wide so they are not narrower than xlspy/Excel AutoFit up to that cap.
+In streaming mode the sheet head is delayed until the first 200 data rows have
+been measured (200 by default). Explicit `columnWidths` entries must be
+0.5-255 characters, always win and are written unchanged.
+
+The stored width is in Excel character units, so the heuristic is independent
+of display DPI. Excel's *displayed* pixel width can still vary with the Normal
+font and screen scaling; 96 DPI gives reproducible visual/COM measurements when
+comparing screenshots or `ColumnWidth` values.
+
+### Reading styles, formulas and rich text (XLSX)
+
+`XlsxReader` exposes metadata for cells in the row returned by the last
+`read()` / `readRow()`:
+
+```typescript
+reader.getStyle(columnIndex);   // CellStyle | null
+reader.getFormula(columnIndex); // formula text without '=', or null
+reader.getRichText(columnIndex); // RichText | null
+```
+
+`XlsbReader.getStyle(columnIndex)` returns the parsed cell style. Formula text
+is not reconstructed by the XLSB reader; formulas are read as their cached
+values.
 
 ---
 
@@ -198,6 +304,11 @@ do {
 } while (await reader.nextResult());
 ```
 
+#### `getStyle(columnIndex: number): CellStyle | null`
+
+Returns the parsed style of the cell in the current row. `null` means the
+default style.
+
 #### `getValue(columnIndex: number): CellValue`
 
 Gets value at the specified column index in the current row.
@@ -264,6 +375,18 @@ See [XlsbReader](#xlsbreader).
 #### `nextResult(): Promise<boolean>`
 
 See [XlsbReader](#xlsbreader).
+
+#### `getFormula(columnIndex: number): string | null`
+
+Formula text without the leading `=` for the current row, or `null`.
+
+#### `getRichText(columnIndex: number): RichText | null`
+
+Rich-text runs for the current row, or `null` for plain strings.
+
+#### `getStyle(columnIndex: number): CellStyle | null`
+
+Parsed cell style for the current row, or `null` for the default style.
 
 #### `getValue(columnIndex: number): CellValue`
 

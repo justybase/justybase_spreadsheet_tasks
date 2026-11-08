@@ -4,6 +4,36 @@
  * A BIFF12 record is: VLQ(id) + VLQ(length) + payload[length].
  */
 
+/** Map an Excel error display text to its BIFF12 error code. */
+export function excelErrorToBiffCode(code: string): number {
+    switch (code) {
+        case '#NULL!': return 0x00;
+        case '#DIV/0!': return 0x07;
+        case '#VALUE!': return 0x0f;
+        case '#REF!': return 0x17;
+        case '#NAME?': return 0x1d;
+        case '#NUM!': return 0x24;
+        case '#N/A': return 0x2a;
+        case '#GETTING_DATA': return 0x2b;
+        default: return 0x0f; // #VALUE!, which is what Excel uses for unknown codes
+    }
+}
+
+/** Map a BIFF12 error code to the text Excel displays. */
+export function biffCodeToExcelError(code: number): string {
+    switch (code) {
+        case 0x00: return '#NULL!';
+        case 0x07: return '#DIV/0!';
+        case 0x0f: return '#VALUE!';
+        case 0x17: return '#REF!';
+        case 0x1d: return '#NAME?';
+        case 0x24: return '#NUM!';
+        case 0x2a: return '#N/A';
+        case 0x2b: return '#GETTING_DATA';
+        default: return '#VALUE!';
+    }
+}
+
 /** Decode a 7-bit VLQ integer at `pos`. Returns the value and the next byte offset. */
 export function readVlq(buf: Buffer, pos: number): { value: number; nextPos: number } {
     let value = 0;

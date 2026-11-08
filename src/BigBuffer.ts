@@ -31,7 +31,7 @@ export class BigBuffer {
         }
     }
 
-    write(buffer: Buffer): void {
+    write(buffer: Uint8Array): void {
         let len = buffer.length;
         let offset = 0;
 
@@ -43,7 +43,7 @@ export class BigBuffer {
             }
 
             const toWrite = Math.min(len, available);
-            buffer.copy(this.currentBuffer, this.cursor, offset, offset + toWrite);
+            this.currentBuffer.set(buffer.subarray(offset, offset + toWrite), this.cursor);
 
             this.cursor += toWrite;
             offset += toWrite;
@@ -84,6 +84,23 @@ export class BigBuffer {
     }
 
     writeString(str: string): void {
+        // Fast path for ASCII markup: write code units directly, no UTF-8 encode.
+        if (this.cursor + str.length <= this.chunkSize) {
+            let ascii = true;
+            for (let i = 0; i < str.length; i++) {
+                if (str.charCodeAt(i) >= 0x80) {
+                    ascii = false;
+                    break;
+                }
+            }
+            if (ascii) {
+                for (let i = 0; i < str.length; i++) {
+                    this.currentBuffer[this.cursor++] = str.charCodeAt(i);
+                }
+                return;
+            }
+        }
+
         const byteLength = Buffer.byteLength(str, 'utf8');
 
         if (this.cursor + byteLength <= this.chunkSize) {
@@ -131,6 +148,23 @@ export class BigBuffer {
             this.cursor = 0;
         }
         return this.chunks;
+    }
+
+    /** Overwrite a previously written 32-bit integer at an absolute offset. */
+    patchInt32LE(offset: number, value: number): boolean {
+        let position = 0;
+        for (const chunk of this.chunks) {
+            if (offset >= position && offset + 4 <= position + chunk.length) {
+                chunk.writeInt32LE(value, offset - position);
+                return true;
+            }
+            position += chunk.length;
+        }
+        if (offset >= position && offset + 4 <= position + this.cursor) {
+            this.currentBuffer.writeInt32LE(value, offset - position);
+            return true;
+        }
+        return false;
     }
 
     reset(): void {

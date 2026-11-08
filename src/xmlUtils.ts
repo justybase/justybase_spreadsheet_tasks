@@ -188,3 +188,87 @@ export function parseSharedStringsXml(xml: string): string[] {
     }
     return result;
 }
+
+/**
+ * Buffer-based equivalent of {@link parseSharedStringsXml} for the common
+ * Excel markup: unprefixed `<si>`/`<t>`, plain or rich runs, self-closing
+ * `<si/>`, and `<rPh>` blocks that must be skipped. Falls back to the regex
+ * parser for anything it does not recognise (CDATA, comments, prefixes,
+ * attributes on `<si>`).
+ */
+export function parseSharedStringsBuffer(buf: Buffer): string[] {
+    const first = buf.indexOf('<si');
+    if (first === -1) return parseSharedStringsXml(buf.toString('utf8'));
+    // The declaration is fine; comments/doctype/prefixed markup are not.
+    const declarationEnd = buf.indexOf('?>');
+    if (buf.indexOf('<!') !== -1 ||
+        (declarationEnd !== -1 && buf.indexOf('<?', declarationEnd + 2) !== -1)) {
+        return parseSharedStringsXml(buf.toString('utf8'));
+    }
+
+    const result: string[] = [];
+    let pos = 0;
+    while (true) {
+        const open = buf.indexOf('<si', pos);
+        if (open === -1) break;
+        const next = buf[open + 3];
+        if (next === 0x2f) { // <si/>
+            result.push('');
+            pos = open + 5;
+            continue;
+        }
+        if (next !== 0x3e) {
+            // Attributes or prefixed name: leave it to the regex parser.
+            return parseSharedStringsXml(buf.toString('utf8'));
+        }
+        const contentStart = open + 4;
+        const close = buf.indexOf('</si>', contentStart);
+        if (close === -1) {
+            return parseSharedStringsXml(buf.toString('utf8'));
+        }
+        let contentPos = contentStart;
+        let value = '';
+        let sawText = false;
+        while (contentPos < close) {
+            const lt = buf.indexOf('<', contentPos);
+            if (lt === -1 || lt >= close) break;
+            if (buf[lt + 1] === 0x72 && buf[lt + 2] === 0x50 && buf[lt + 3] === 0x68) {
+                // <rPh ...>…</rPh> or <rPh .../>
+                const tagEnd = buf.indexOf('>', lt);
+                if (tagEnd === -1) return parseSharedStringsXml(buf.toString('utf8'));
+                if (buf[tagEnd - 1] === 0x2f) {
+                    contentPos = tagEnd + 1;
+                } else {
+                    const rphEnd = buf.indexOf('</rPh>', tagEnd + 1);
+                    if (rphEnd === -1) return parseSharedStringsXml(buf.toString('utf8'));
+                    contentPos = rphEnd + 6;
+                }
+                continue;
+            }
+            if (buf[lt + 1] === 0x74 && (
+                buf[lt + 2] === 0x3e || buf[lt + 2] === 0x20 ||
+                buf[lt + 2] === 0x09 || buf[lt + 2] === 0x0a || buf[lt + 2] === 0x0d
+            )) {
+                const tagEnd = buf.indexOf('>', lt);
+                if (tagEnd === -1 || tagEnd >= close) return parseSharedStringsXml(buf.toString('utf8'));
+                const textEnd = buf.indexOf('</t>', tagEnd + 1);
+                if (textEnd === -1 || textEnd > close) return parseSharedStringsXml(buf.toString('utf8'));
+                if (sawText) {
+                    value += buf.toString('utf8', tagEnd + 1, textEnd);
+                } else {
+                    value = buf.toString('utf8', tagEnd + 1, textEnd);
+                    sawText = true;
+                }
+                contentPos = textEnd + 4;
+                continue;
+            }
+            // <r>, </r>, <rPr> and its children: skip the tag.
+            const tagEnd = buf.indexOf('>', lt);
+            if (tagEnd === -1) return parseSharedStringsXml(buf.toString('utf8'));
+            contentPos = tagEnd + 1;
+        }
+        result.push(unescapeXmlText(value));
+        pos = close + 5;
+    }
+    return result;
+}

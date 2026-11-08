@@ -1,0 +1,248 @@
+{
+  "version": 1,
+  "description": "Shared test cases for SpreadSheetTasks (C#), justybase_spreadsheet_tasks (TS) and xlspy (Python). Every library writes these workbooks; Microsoft Excel (COM) verifies them. Excel also writes the same cases so every library can be checked as a reader.",
+  "cell_encoding": "null = empty cell; string/number/bool = literal; {\"date\": \"yyyy-MM-ddTHH:mm:ss\"} = date-time; {\"value\": v, \"numberFormat\": \"fmt\"} = value with a number format. generator: { rows, header } creates a header row + N rows [i, \"row-i\", i * 0.25] (i = 1..N). { rows, columns } creates headers \"C01\"..\"C<columns>\" (zero-padded to 2 digits) + N rows whose cell at column j (1-based) is i * 1000 + j.",
+  "cases": [
+    {
+      "id": "basic_text",
+      "sheets": [
+        {
+          "name": "Data",
+          "autoFilter": true,
+          "rows": [
+            ["Name", "City", "Note"],
+            ["Alice", "Warsaw", "first"],
+            ["Bob", "Berlin", "second"],
+            ["Carla", "Madrid", "third"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "no_autofilter",
+      "sheets": [
+        {
+          "name": "Data",
+          "autoFilter": false,
+          "rows": [
+            ["Name", "Score"],
+            ["Alice", 10],
+            ["Bob", 20]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "numeric_types",
+      "sheets": [
+        {
+          "name": "Numbers",
+          "autoFilter": false,
+          "rows": [
+            ["Label", "Value"],
+            ["zero", 0],
+            ["negative int", -1],
+            ["int32 max", 2147483647],
+            ["safe int", 9007199254740991],
+            ["fraction", 0.1],
+            ["negative fraction", -2.5],
+            ["pi", 3.14159265358979],
+            ["small", 0.000125],
+            ["large", 123456789012.5]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "booleans_and_nulls",
+      "sheets": [
+        {
+          "name": "Flags",
+          "autoFilter": false,
+          "rows": [
+            ["Flag", "Other"],
+            [true, null],
+            [false, "x"],
+            [null, true],
+            [true, false]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dates",
+      "sheets": [
+        {
+          "name": "Dates",
+          "autoFilter": false,
+          "rows": [
+            ["Label", "When"],
+            ["day", {"date": "2024-03-15T00:00:00"}],
+            ["with time", {"date": "2024-03-15T10:30:00"}],
+            ["old date", {"date": "1901-01-01T00:00:00"}],
+            ["end of day", {"date": "1999-12-31T23:59:59"}]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "unicode_and_escaping",
+      "sheets": [
+        {
+          "name": "Text",
+          "autoFilter": false,
+          "rows": [
+            ["Kind", "Value"],
+            ["polish", "Zażółć gęślą jaźń"],
+            ["emoji", "smile 😀 and 𝒜"],
+            ["xml chars", "a & b < c > d \" ' e"],
+            ["padding", "  padded  "],
+            ["newline", "line1\nline2"],
+            ["crlf", "line1\r\nline2"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multi_sheet_hidden",
+      "sheets": [
+        {
+          "name": "Alpha",
+          "autoFilter": false,
+          "rows": [["sheet", "n"], ["alpha", 1]]
+        },
+        {
+          "name": "Beta",
+          "hidden": true,
+          "autoFilter": false,
+          "rows": [["sheet", "n"], ["beta", 2]]
+        },
+        {
+          "name": "Gamma",
+          "autoFilter": false,
+          "rows": [["sheet", "n"], ["gamma", 3]]
+        }
+      ]
+    },
+    {
+      "id": "sheet_names_special",
+      "sheets": [
+        {
+          "name": "Sales 2024 Q1",
+          "autoFilter": false,
+          "rows": [["a"], ["alpha"]]
+        },
+        {
+          "name": "Dane-PL",
+          "autoFilter": false,
+          "rows": [["b"], ["beta"]]
+        }
+      ]
+    },
+    {
+      "id": "wide_sheet",
+      "sheets": [
+        {
+          "name": "Wide",
+          "autoFilter": false,
+          "generator": {"rows": 3, "columns": 60}
+        }
+      ]
+    },
+    {
+      "id": "many_rows",
+      "sheets": [
+        {
+          "name": "Big",
+          "autoFilter": true,
+          "generator": {"rows": 20000, "header": ["id", "name", "value"]}
+        }
+      ]
+    },
+    {
+      "id": "header_only",
+      "sheets": [
+        {
+          "name": "Empty",
+          "autoFilter": false,
+          "rows": [["only", "header", "row"]]
+        }
+      ]
+    },
+    {
+      "id": "sparse_grid",
+      "sheets": [
+        {
+          "name": "Sparse",
+          "autoFilter": false,
+          "rows": [
+            ["a1", null, null, null, null],
+            [null, null, null, null, null],
+            [null, null, null, null, null],
+            [null, null, null, null, "e4"],
+            [null, "b5", null, null, null]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "update_template",
+      "sheets": [
+        {
+          "name": "Data",
+          "autoFilter": false,
+          "rows": [
+            ["old", "value"],
+            ["x", 1],
+            ["y", 2],
+            ["z", 3]
+          ]
+        },
+        {
+          "name": "Keep",
+          "autoFilter": false,
+          "rows": [["keep me"], ["untouched"]]
+        }
+      ]
+    },
+    {
+      "id": "update_result",
+      "description": "Expected result when the library replaces sheet Data of update_template with the rows of this case's Data sheet (header row = headers argument). Sheet Keep must be unchanged.",
+      "sheets": [
+        {
+          "name": "Data",
+          "autoFilter": false,
+          "rows": [
+            ["id", "label", "amount"],
+            [1, "new-one", 10.5],
+            [2, "new-two", null],
+            [3, "new-three", {"date": "2025-01-02T00:00:00"}]
+          ]
+        },
+        {
+          "name": "Keep",
+          "autoFilter": false,
+          "rows": [["keep me"], ["untouched"]]
+        }
+      ]
+    },
+    {
+      "id": "number_format",
+      "sheets": [
+        {
+          "name": "Formatted",
+          "autoFilter": false,
+          "rows": [
+            ["label", "amount"],
+            ["thousands", {"value": 1234567.891, "numberFormat": "#,##0.00"}],
+            ["percent", {"value": 0.25, "numberFormat": "0.0%"}]
+          ],
+          "checks": [
+            {"type": "numberFormat", "address": "B2", "expected": "#,##0.00"},
+            {"type": "numberFormat", "address": "B3", "expected": "0.0%"}
+          ]
+        }
+      ]
+    }
+  ]
+}
