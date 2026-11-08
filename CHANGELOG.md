@@ -5,6 +5,84 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-11-08
+
+### Added
+
+- Shared writer core (`src/writers/core`) used by the Node and browser XLSX/XLSB
+  writers. The unpacked package parts are byte-identical between Node and browsers.
+- `useSharedStrings: false` writer option for inline strings (four writers).
+- `ExcelError` cell value and round-trip support for Excel error cells.
+- `XlsxReader.openBuffer()` and `XlsbReader.openBuffer()` plus `readRow()`,
+  `readAll()` and `rows()` batch APIs.
+- Isolated-process I/O benchmark (`npm run benchmark:io`) with a 3% regression
+  gate, and a self-contained Microsoft Excel COM conformance suite
+  (`EXCEL_COM=1 npm run test:excel-com`).
+- Etap 2 cell formatting: `CellStyle`, `StyledCell`, `FormulaCell`, `RichText`
+  and style helpers. `FormattedCell` remains supported.
+- XLSX styling: fonts, fills, borders, alignment, protection, custom number
+  formats and differential styles for conditional formatting.
+- XLSX sheet features: formula cells with cached values, rich text, merged
+  cells, hyperlinks, data validation, conditional formatting and cell comments
+  (classic notes with VML).
+- XLSB styling and formulas: a BIFF12 style registry and a curated formula
+  compiler with cached values; merged cells, hyperlinks and data validation.
+- Conservative column autofit (header + up to 200 sample rows, capped at 200,
+  not narrower than xlspy/Excel AutoFit up to that cap) and explicit
+  `columnWidths` overrides in all four writers. Streaming writers delay the
+  sheet head until the first 200 data rows have been measured.
+- `XlsxReader.getStyle()`, `getFormula()` and `getRichText()`; `XlsbReader.getStyle()`.
+
+### Changed
+
+- `writeSheet` accepts a sheet-options object in place of the legacy
+  `doAutofilter` boolean while keeping the boolean overload backward compatible.
+- `updateColWidthsFromRows` understands styled, formula and rich-text cells.
+- Autofit is deliberately conservative so it is not narrower than
+  xlspy/Excel AutoFit up to the 200 cap: columns use the 8.43 minimum, calibrated
+  character costs (CJK/fullwidth, emoji, wide fonts, bold/italic and font
+  size), number/date-format display text, room for the autofilter button, the
+  5/7-character cell padding, and a 200-character cap on the stored width. The
+  default fallback width is 9.14.
+- Autofit also measures alignment indent, the longest line of wrapped text,
+  negative number-format sections, and Excel's 11-character General rendering
+  instead of the full JavaScript decimal expansion.
+- `options.autofitRows` controls how many rows are measured (default 200;
+  `0` disables row sampling).
+- XLSB column widths are written as full 1/256-character units instead of
+  floored integers.
+- Explicit `columnWidths` values are validated to 0.5-255 characters.
+
+### Fixed
+
+- XLSX reading no longer scans the rest of the sheet for every cell. The
+  formula lookup was unbounded, so a 20,000 x 10 sheet took minutes to read
+  instead of milliseconds; tag and value lookups are now bounded to the cell.
+- XLSX numeric cells are parsed without allocating an intermediate string
+  (`parseFloat` is still used for exponents and long mantissas), restoring
+  read throughput close to the pre-Etap-2 reader.
+- Dates with a time of day now use the datetime style (`numFmt` 22) in XLSX and
+  XLSB instead of the date-only style, so the time is no longer hidden.
+- Streaming `writeRow()` now feeds autofit instead of leaving columns sized only
+  from the header and `sampleRows`.
+- Long runs of accented Latin, Greek/Cyrillic and symbol characters are no
+  longer measured narrower than xlspy; a per-character exception table covers
+  the outliers.
+- XLSB `BrtWsDim` now contains the real last row and an inclusive last column;
+  previously rows were always 0 and the column was one past the data.
+- XLSB cells with an error value are read as `#DIV/0!`-style text instead of `null`.
+- XLSX reader resolves optional `r`/`t`/`s` cell attributes from raw bytes
+  (previously attribute-less and typed cells could be misread).
+- XLSB custom number formats no longer produce a corrupt styles part.
+
+### Limitations
+
+- XLSB rich text, comments and conditional formatting are not emitted yet; the
+  writers throw a clear error instead of silently dropping them.
+- XLSB formula support is a subset (literals, A1 references/ranges, operators
+  and common worksheet functions); unsupported syntax throws.
+- `XlsbReader` does not reconstruct formula text; it returns cached values.
+
 ## [3.1.1] - 2026-10-24
 
 ### Changed
