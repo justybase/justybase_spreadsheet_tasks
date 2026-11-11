@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.1] - 2026-11-11
+
+### Changed
+
+- Faster XLSX reads: short cell tags are scanned with a byte loop instead of
+  `Buffer.indexOf`, and decimal values use a precomputed powers-of-ten table.
+  Reads are about 25% faster on the mixed and number-heavy benchmark files.
+
 ## [3.2.0] - 2026-11-08
 
 ### Added
