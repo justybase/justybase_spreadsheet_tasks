@@ -13,6 +13,7 @@ import * as path from 'path';
 import { CellValue } from '../../src/Formats';
 import { XlsxReader } from '../../src/XlsxReader';
 import { XlsxWriter } from '../../src/XlsxWriter';
+import { createMinimalXlsx } from '../helpers/minimalXlsx';
 
 const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spreadsheet-reader-throughput-'));
 const MAX_READ_MS = 10_000;
@@ -111,10 +112,47 @@ async function testNumericPrecision(): Promise<void> {
     await reader.close();
 }
 
+async function testLongDecimalTail(): Promise<void> {
+    // Leading zeros after the decimal point can push `decimals` past the
+    // precomputed POW10 table even with a single significant digit; those
+    // values must use the Math.pow fallback and still match parseFloat.
+    const values = [
+        '0.0000000000000001',
+        '0.000000000000000000001',
+        '-0.0000000000000001',
+        '0.123456789012345',
+    ];
+    const cells = values
+        .map((value, i) => `<c r="${String.fromCharCode(65 + i)}1"><v>${value}</v></c>`)
+        .join('');
+    const file = path.join(outputDir, 'decimal-tail.xlsx');
+    createMinimalXlsx(file, {
+        sheets: [{
+            name: 'Data',
+            rId: 'rId1',
+            xml: '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                + `<sheetData><row r="1">${cells}</row></sheetData></worksheet>`,
+        }],
+    });
+
+    const reader = new XlsxReader();
+    await reader.open(file);
+    await reader.selectSheet(0);
+    const row = reader.readRow();
+    assert(row !== null, 'decimal-tail row missing');
+    for (let i = 0; i < values.length; i++) {
+        assert(Object.is(row![i], parseFloat(values[i])),
+            `decimal tail ${values[i]}: got ${String(row![i])}`);
+    }
+    assert(reader.readRow() === null, 'decimal-tail has no extra rows');
+    await reader.close();
+}
+
 async function main(): Promise<void> {
     await testNumericSheet();
     await testInlineStrings();
     await testNumericPrecision();
+    await testLongDecimalTail();
     console.log('Reader throughput tests passed');
 }
 

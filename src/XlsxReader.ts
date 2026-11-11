@@ -40,8 +40,10 @@ function parseIsoDateUtc(value: string): Date | null {
 
 /** Index of the `>` that closes a tag starting at `start`, or -1. */
 function tagEndIndex(buf: Buffer, start: number, limit: number): number {
-    const end = buf.indexOf(0x3e, start);
-    return end === -1 || end >= limit ? -1 : end;
+    for (let i = start; i < limit; i++) {
+        if (buf[i] === 0x3e) return i;
+    }
+    return -1;
 }
 
 const BYTE_LT = 0x3c;
@@ -134,6 +136,14 @@ function parseUint(buf: Buffer, start: number, end: number): number {
 }
 
 /**
+ * Exact powers of ten used by `parseNumberBytes`. `10^0..10^15` are exactly
+ * representable; initialising from `Math.pow` keeps the table bit-identical to
+ * the old direct call. Longer fractions fall back to `Math.pow`.
+ */
+const POW10 = new Float64Array(16);
+for (let i = 0; i < POW10.length; i++) POW10[i] = Math.pow(10, i);
+
+/**
  * Parse a plain ASCII decimal number without allocating a string.
  *
  * Integers and decimals with at most 15 significant digits are exact (the
@@ -173,7 +183,9 @@ function parseNumberBytes(buf: Buffer, start: number, end: number): number {
         }
     }
     if (!sawDigit) return NaN;
-    const value = decimals === 0 ? mantissa : mantissa / Math.pow(10, decimals);
+    const value = decimals === 0
+        ? mantissa
+        : mantissa / (decimals < POW10.length ? POW10[decimals] : Math.pow(10, decimals));
     return negative ? -value : value;
 }
 
