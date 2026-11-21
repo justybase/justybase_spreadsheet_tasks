@@ -20,7 +20,15 @@ export type {
     ConditionalFormatSpec,
     ConditionalFormatRule,
     CommentSpec,
+    SheetLayoutOptions,
 } from './writers/core/xlsxParts';
+export type {
+    GroupSpec,
+    TableSpec,
+    TableColumnSpec,
+    SheetProtectionSpec,
+    FreezePane,
+} from './writers/core/sheetLayout';
 
 // Updater (in-place update of an existing workbook)
 export { XlsxUpdater, XlsmUpdater } from './XlsxUpdater';
@@ -45,6 +53,8 @@ export {
     FontStyle,
     FontUnderline,
     FillStyle,
+    GradientFillStyle,
+    GradientStop,
     PatternType,
     BorderStyle,
     BorderSide,
@@ -64,6 +74,7 @@ export {
     getCellStyle,
     getFormula,
     mergeCellStyle,
+    mergeCellStyles,
     unwrapCell,
     getFormat,
 } from './Formats';

@@ -34,8 +34,9 @@ High-performance TypeScript library for reading and writing Excel files in XLSB 
 - **Buffer I/O** - `openBuffer()` reads a workbook from memory; `readAll()`/`rows()` batch APIs
 - **Styles and Formats** - Fonts, fills, borders, alignment, protection and number formats (`CellStyle`)
 - **Formulas** - Write formula cells with cached values (`FormulaCell`); XLSX and a curated XLSB formula subset
-- **Sheet Features** - Merged cells, hyperlinks, data validation, comments and conditional formatting in XLSX; merges, hyperlinks and validation in XLSB
-- **Rich Text** - Formatted text runs in XLSX shared and inline strings
+- **Sheet Features** - Merged cells, hyperlinks, data validation, comments, conditional formatting, Excel tables and sheet protection in both XLSX and XLSB
+- **Rich Text** - Formatted text runs in XLSX shared/inline strings and XLSB shared strings
+- **Layout and Outline** - Header/range styles, row heights, hidden rows/columns, grouped outlines, frozen panes, tab colours, zoom and view flags in both writers
 - **Conservative Column Autofit** - Not narrower than xlspy/Excel AutoFit up to the 200 cap; explicit `columnWidths` override it
 - **Excel Error Values** - Read and write `#DIV/0!`, `#N/A` and the other Excel errors
 - **Multiple Sheets** — Support for multiple worksheets per workbook
@@ -111,9 +112,13 @@ The browser bundle has **no runtime npm dependencies** (ZIP logic is inlined).
 
 - Built-in ZIP archiving (no external libraries in the bundle)
 - Memory-efficient `Uint8Array` buffer handling
-- Auto-fitted column widths
-- Frozen and styled headers (styles: `bold`, `fill`, `bold+fill`)
-- Auto-filters enabled by default
+- Auto-fitted column widths and explicit column widths
+- Full `CellStyle` support (fonts, fills, gradients, borders, alignment, protection)
+- Rich text, formulas with cached values, merges, hyperlinks and data validation
+- Excel tables, conditional formats, comments and sheet protection (XLSX and XLSB)
+- Row heights, hidden rows/columns, outline groups, frozen panes, tab colours,
+  zoom, gridline/header/zero-value toggles and right-to-left views
+- Auto-filters enabled by default, with `autoFilterRef` overrides
 
 See [CHANGELOG.md](./CHANGELOG.md) for v2 breaking changes (`await reader.read()`).
 
@@ -315,9 +320,13 @@ until the first 200 data rows have been measured. Explicit
 `columnWidths` must be 0.5-255 characters and are written unchanged.
 
 XLSB supports `CellStyle`, `FormulaCell` (a formula subset with cached values),
-`merges`, `hyperlinks`, `dataValidations` and `columnWidths`. Rich text,
-comments and conditional formatting are XLSX-only and throw a clear error when
-passed to an XLSB writer.
+rich text, `merges`, `hyperlinks`, `dataValidations`, `conditionalFormats`,
+`comments`, Excel tables, sheet protection and the shared layout options
+(`headerStyle`, `styles`, row/column sizes and groups, freeze panes, tab
+colours, views and zoom). Only the OpenXML-specific border sides
+(`start`/`end`/`vertical`/`horizontal`), `relativeIndent` and the
+`quotePrefix`/`pivotButton` cell flags are rejected for XLSB; use `XlsxWriter`
+when those are required.
 
 XlsxReader exposes the style, formula and rich-text runs of the last read row:
 

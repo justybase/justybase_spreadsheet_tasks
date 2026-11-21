@@ -33,15 +33,16 @@ const DV_ERROR_STYLES: Record<string, number> = {
     information: 2,
 };
 
+// BIFF12 XlDVOperator order (unlike the OOXML attribute order).
 const DV_OPERATORS: Record<string, number> = {
     between: 0,
     notBetween: 1,
     equal: 2,
     notEqual: 3,
-    lessThan: 4,
-    lessThanOrEqual: 5,
-    greaterThan: 6,
-    greaterThanOrEqual: 7,
+    greaterThan: 4,
+    lessThan: 5,
+    greaterThanOrEqual: 6,
+    lessThanOrEqual: 7,
 };
 
 interface CellRange {
@@ -147,9 +148,12 @@ function literalListFormula(values: string[]): string {
     return `"${values.map(value => value.replace(/"/g, '""')).join(',')}"`;
 }
 
-function validationFormula(text: string | undefined): Uint8Array {
+function validationFormula(
+    text: string | undefined,
+    origin: { col: number; row: number },
+): Uint8Array {
     if (text === undefined || text === '') return new Uint8Array(8);
-    const tokens = compileXlsbFormula(text);
+    const tokens = compileXlsbFormula(text, { origin, relativeOffsets: true });
     return Uint8Array.from([...u32(tokens.length), ...tokens, ...u32(0)]);
 }
 
@@ -164,6 +168,7 @@ export function buildXlsbValidationRecords(validations: DataValidationSpec[]): U
     for (const rule of validations) {
         const ranges = rule.sqref.trim().split(/\s+/).map(parseXlsbRange);
         if (ranges.length === 0) throw new Error('Data validation sqref must not be empty');
+        const origin = { col: ranges[0].c1, row: ranges[0].r1 };
 
         let flags = DV_TYPES[rule.type] ?? 0;
         flags |= (DV_ERROR_STYLES[rule.errorStyle ?? 'stop'] ?? 0) << 4;
@@ -188,8 +193,8 @@ export function buildXlsbValidationRecords(validations: DataValidationSpec[]): U
         const formula1 = isLiteralList
             ? literalListFormula(rule.values!)
             : rule.formula1;
-        payload.push(...validationFormula(formula1));
-        payload.push(...validationFormula(rule.formula2));
+        payload.push(...validationFormula(formula1, origin));
+        payload.push(...validationFormula(rule.formula2, origin));
         parts.push(buildBrtRecord(BRT_DVAL, Uint8Array.from(payload)));
     }
     parts.push(buildBrtRecord(BRT_END_DVALS, new Uint8Array(0)));

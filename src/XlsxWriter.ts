@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import archiver from 'archiver';
 import { Readable } from 'stream';
 import { BigBuffer } from './BigBuffer';
-import { CellValue, CellStyle } from './Formats';
+import { CellValue, CellStyle, StyleColor, mergeCellStyles } from './Formats';
 import { TextByteSink } from './writers/core/ByteSink';
 import { StreamingSheetState } from './StreamingSheetState';
 import {
@@ -37,6 +37,8 @@ import {
     DataValidationSpec,
     HyperlinkSpec,
     SharedStringValue,
+    SheetLayoutOptions,
+    buildXlsxTableXml,
     writeXlsxCell,
     writeXlsxInlineStringCell,
     writeXlsxSharedStringCell,
@@ -44,10 +46,76 @@ import {
     writeXlsxSheetTail,
     XLSX_REL_COMMENTS,
     XLSX_REL_HYPERLINK,
+    XLSX_REL_TABLE,
     XLSX_REL_VML,
     XlsxSheetFeatures,
     XlsxStyleRegistry,
+    xlsxRowAttributes,
 } from './writers/core/xlsxParts';
+import {
+    FreezePane,
+    NormalizedTableSpec,
+    Outline,
+    StyleRangeSet,
+    buildOutline,
+    normalizeGroups,
+    normalizeTableSpec,
+    parseRangeRef,
+    resolveFreezePanes,
+    validateRowHeight,
+    validateZoom,
+    tableTotalsOverrides,
+    TableTotalsOverride,
+    SheetProtectionSpec,
+} from './writers/core/sheetLayout';
+
+/** Apply table totals overrides to one row, preserving the caller's style/cache. */
+function withTableTotals(row: CellValue[], overrides: TableTotalsOverride[]): CellValue[] {
+    let result: CellValue[] | null = null;
+    for (const override of overrides) {
+        if (override.col < 0) continue;
+        const original = row[override.col];
+        const record = original !== null && typeof original === 'object' && !(original instanceof Date)
+            ? original as unknown as Record<string, unknown>
+            : null;
+        const style = record && record.style ? record.style as CellStyle : undefined;
+        const cachedValue = record?.value;
+        const cached = typeof cachedValue === 'string' || typeof cachedValue === 'number'
+            || typeof cachedValue === 'boolean' || cachedValue instanceof Date
+            ? cachedValue
+            : (typeof original === 'number' ? original : undefined);
+        const replacement: CellValue = override.text !== undefined
+            ? (style ? { value: override.text, style } : override.text)
+            : {
+                formula: override.formula as string,
+                ...(cached !== undefined ? { value: cached } : {}),
+                ...(style ? { style } : {}),
+            } as CellValue;
+        if (!result) result = row.slice();
+        result[override.col] = replacement;
+    }
+    return result ?? row;
+}
+
+interface ResolvedSheetLayout {
+    headerStyle: CellStyle | null;
+    styleRanges: StyleRangeSet;
+    rowHeights: Record<number, number>;
+    hiddenRows: Set<number>;
+    hiddenColumns: number[];
+    rowOutline: Outline;
+    columnOutline: Outline;
+    freezePanes: FreezePane | null;
+    showGridLines: boolean;
+    showRowColHeaders: boolean;
+    showZeroValues: boolean;
+    rightToLeft: boolean;
+    zoom?: number;
+    tabColor?: StyleColor;
+    sheetProtection?: SheetProtectionSpec;
+    autoFilterRef?: string;
+    tables: NormalizedTableSpec[];
+}
 
 interface SheetInfo {
     name: string;
@@ -65,9 +133,11 @@ interface SheetInfo {
     legacyDrawingRId?: string;
     sheetRelsXml?: string;
     extraParts?: Array<{ name: string; data: string }>;
+    layout?: ResolvedSheetLayout;
+    tableParts?: Array<{ id: number; path: string; xml: string; rId: string }>;
 }
 
-export interface XlsxSheetOptions extends XlsxSheetFeatures {
+export interface XlsxSheetOptions extends XlsxSheetFeatures, SheetLayoutOptions {
     hidden?: boolean;
     doAutofilter?: boolean;
     sampleRows?: unknown[][];
@@ -97,6 +167,7 @@ export class XlsxWriter {
     private readonly _styles = new XlsxStyleRegistry();
     private sstCntAll: number = 0;
     private _autofilterIsOn: boolean = false;
+    private _nextTableId: number = 1;
 
     private _oaEpoch: number;
 
@@ -109,6 +180,7 @@ export class XlsxWriter {
     private _streamHasHeaders: boolean = false;
     private _streamDataRows: number = 0;
     private _streamAutofitRows: number = AUTOFIT_SAMPLE_ROWS;
+    private _streamTableTotals: Map<number, TableTotalsOverride[]> = new Map();
 
     /**
      * @param filePath Destination `.xlsx` path on disk.
@@ -200,8 +272,119 @@ export class XlsxWriter {
         return widths;
     }
 
+    /** Validate layout options and resolve styles, outlines and tables. */
+    private _resolveLayout(
+        options: XlsxSheetOptions,
+        hasHeaders: boolean,
+        columnCount: number,
+        headers: string[] | null | undefined,
+        rowCount: number = 0,
+    ): ResolvedSheetLayout {
+        const rowHeights: Record<number, number> = {};
+        for (const [key, value] of Object.entries(options.rowHeights ?? {})) {
+            const row = Number(key);
+            if (!Number.isInteger(row) || row < 0) {
+                throw new RangeError(`rowHeights keys must be non-negative row indices, got '${key}'`);
+            }
+            rowHeights[row] = validateRowHeight(value);
+        }
+
+        const hiddenRows = new Set<number>();
+        for (const row of options.hiddenRows ?? []) {
+            if (!Number.isInteger(row) || row < 0) {
+                throw new RangeError(`hiddenRows must contain non-negative row indices, got ${row}`);
+            }
+            hiddenRows.add(row);
+        }
+
+        const hiddenColumns: number[] = [];
+        for (const col of options.hiddenColumns ?? []) {
+            if (!Number.isInteger(col) || col < 0 || col >= columnCount) {
+                throw new RangeError(`hiddenColumns index ${col} is outside the sheet`);
+            }
+            hiddenColumns.push(col);
+        }
+
+        const rowGroups = normalizeGroups(options.rowGroups, 'row');
+        const columnGroups = normalizeGroups(options.columnGroups, 'column');
+        const rowMax = Math.max(
+            rowCount - 1,
+            ...rowGroups.map(group => group.end),
+            ...Object.keys(rowHeights).map(Number),
+            ...hiddenRows,
+            0,
+        );
+        const columnMax = Math.max(
+            columnCount - 1,
+            ...columnGroups.map(group => group.end),
+            ...hiddenColumns,
+            0,
+        );
+        const rowOutline = buildOutline(rowGroups, rowMax);
+        const columnOutline = buildOutline(columnGroups, columnMax);
+
+        const tables: NormalizedTableSpec[] = [];
+        for (const spec of options.tables ?? []) {
+            let columns = spec.columns;
+            if ((!columns || columns.length === 0) && headers) {
+                const range = parseRangeRef(spec.ref);
+                columns = headers.slice(range.c1, range.c2 + 1);
+                if (columns.length !== range.c2 - range.c1 + 1) {
+                    throw new Error(`Table '${spec.name}' columns cannot be derived from the headers`);
+                }
+            }
+            tables.push(normalizeTableSpec({ ...spec, columns }, this._nextTableId++));
+        }
+
+        if (options.autoFilterRef !== undefined) parseRangeRef(options.autoFilterRef);
+
+        return {
+            headerStyle: options.headerStyle ?? null,
+            styleRanges: new StyleRangeSet(options.styles),
+            rowHeights,
+            hiddenRows,
+            hiddenColumns,
+            rowOutline,
+            columnOutline,
+            freezePanes: resolveFreezePanes(options.freezePanes, hasHeaders),
+            showGridLines: options.showGridLines !== false,
+            showRowColHeaders: options.showRowColHeaders !== false,
+            showZeroValues: options.showZeroValues !== false,
+            rightToLeft: options.rightToLeft === true,
+            zoom: validateZoom(options.zoom),
+            tabColor: options.tabColor,
+            sheetProtection: options.sheetProtection,
+            autoFilterRef: options.autoFilterRef,
+            tables,
+        };
+    }
+
+    private _headerStyleIndex(layout: ResolvedSheetLayout): number {
+        if (!layout.headerStyle) return 3;
+        return this._styles.register(mergeCellStyles({ font: { bold: true } }, layout.headerStyle));
+    }
+
+    /** Build table parts and their relationship ids for one sheet. */
+    private _buildTableParts(sheet: SheetInfo, layout: ResolvedSheetLayout, nextRelId: number): number {
+        if (layout.tables.length === 0) return nextRelId;
+        const parts: Array<{ id: number; path: string; xml: string; rId: string }> = [];
+        for (const table of layout.tables) {
+            const id = this._nextTableId - layout.tables.length + parts.length;
+            const path = `xl/tables/table${id}.xml`;
+            parts.push({
+                id,
+                path,
+                xml: buildXlsxTableXml(table, id),
+                rId: `rId${nextRelId++}`,
+            });
+        }
+        sheet.tableParts = parts;
+        sheet.extraParts = [...(sheet.extraParts ?? []), ...parts.map(part => ({ name: part.path, data: part.xml }))];
+        return nextRelId;
+    }
+
     /** Store sheet features and build the worksheet rels/comments parts. */
-    private _applySheetFeatures(sheet: SheetInfo, features: XlsxSheetFeatures): void {
+    private _applySheetFeatures(sheet: SheetInfo, features: XlsxSheetFeatures, layout?: ResolvedSheetLayout): void {
         if (features.merges) sheet.merges = features.merges;
         if (features.dataValidations) sheet.dataValidations = features.dataValidations;
         if (features.conditionalFormats) sheet.conditionalFormats = features.conditionalFormats;
@@ -244,6 +427,17 @@ export class XlsxWriter {
             ];
         }
 
+        if (layout && layout.tables.length > 0) {
+            nextRelId = this._buildTableParts(sheet, layout, nextRelId);
+            for (const part of sheet.tableParts ?? []) {
+                rels.push({
+                    id: part.rId,
+                    type: XLSX_REL_TABLE,
+                    target: `../tables/${part.path.split('/').pop()}`,
+                });
+            }
+        }
+
         if (rels.length > 0) sheet.sheetRelsXml = buildXlsxSheetRels(rels);
     }
 
@@ -275,7 +469,15 @@ export class XlsxWriter {
 
         this.addSheet(sheetName, hidden);
         const sheet = this.sheetList[this.sheetCount - 1];
-        this._applySheetFeatures(sheet, options);
+        const layout = this._resolveLayout(options, headers !== undefined, columnCount, headers);
+        sheet.layout = layout;
+        this._streamTableTotals = new Map();
+        for (const override of tableTotalsOverrides(layout.tables)) {
+            const list = this._streamTableTotals.get(override.row) ?? [];
+            list.push(override);
+            this._streamTableTotals.set(override.row, list);
+        }
+        this._applySheetFeatures(sheet, options, layout);
 
         this.stream.begin(columnCount, doAutofilter && headers !== undefined, new BigBuffer());
 
@@ -305,10 +507,16 @@ export class XlsxWriter {
         if (headers) {
             this.stream.rowNum++;
             const pending = this._streamPending;
-            pending.writeString(`<row r="${this.stream.rowNum}">`);
+            pending.writeString(`<row r="${this.stream.rowNum}"${xlsxRowAttributes(0, layout)}>`);
+            const headerStyle = this._headerStyleIndex(layout);
+            const baseHeader = mergeCellStyles({ font: { bold: true } }, layout.headerStyle);
             // Headers are contiguous from column A, so no cell needs `r`.
             for (let c = 0; c < headers.length; c++) {
-                this._writeStringCell(pending, headers[c], '', 3);
+                const rangeStyle = layout.styleRanges.styleFor(0, c);
+                const style = rangeStyle
+                    ? this._styles.register(mergeCellStyles(baseHeader, rangeStyle))
+                    : headerStyle;
+                this._writeStringCell(pending, headers[c], '', style);
             }
             pending.writeString('</row>');
         }
@@ -320,12 +528,22 @@ export class XlsxWriter {
         if (this._streamHeadFlushed) return;
         const bigBuf = this.stream.assertStreaming();
         const pending = this._streamPending;
+        const layout = this.sheetList[this.sheetCount - 1]?.layout;
         writeXlsxSheetHead(bigBuf, {
             dimensionRef: 'A1',
             columnCount: this.stream.endCol,
             isFirstSheet: this.sheetCount === 1,
             hasHeaders: this._streamHasHeaders,
             colWidths: this.stream.colWidths,
+            freezePanes: layout?.freezePanes,
+            showGridLines: layout?.showGridLines,
+            showRowColHeaders: layout?.showRowColHeaders,
+            showZeroValues: layout?.showZeroValues,
+            rightToLeft: layout?.rightToLeft,
+            zoom: layout?.zoom,
+            tabColor: layout?.tabColor,
+            hiddenColumns: layout?.hiddenColumns,
+            columnOutline: layout?.columnOutline,
         });
         if (pending) {
             for (const chunk of pending.getChunks()) bigBuf.write(chunk);
@@ -337,10 +555,14 @@ export class XlsxWriter {
     private _writeStreamRow(bigBuf: BigBuffer, row: CellValue[]): void {
         this.stream.rowNum++;
         assertRowCount(this.stream.rowNum);
-        bigBuf.writeString(`<row r="${this.stream.rowNum}">`);
+        const layout = this.sheetList[this.sheetCount - 1]?.layout;
+        const totals = this._streamTableTotals.get(this.stream.rowNum - 1);
+        if (totals) row = withTableTotals(row, totals);
+        bigBuf.writeString(`<row r="${this.stream.rowNum}"${xlsxRowAttributes(this.stream.rowNum - 1, layout)}>`);
 
         let prevCol = -1;
         for (let c = 0; c < row.length; c++) {
+            const rangeStyle = layout?.styleRanges.styleFor(this.stream.rowNum - 1, c);
             prevCol = writeXlsxCell(
                 bigBuf,
                 this,
@@ -349,6 +571,9 @@ export class XlsxWriter {
                 prevCol,
                 this.currentColLetters[c],
                 this.stream.rowNum,
+                1,
+                2,
+                rangeStyle,
             );
         }
         bigBuf.writeString('</row>');
@@ -391,6 +616,9 @@ export class XlsxWriter {
             conditionalFormats: sheet.conditionalFormats,
             legacyDrawingRId: sheet.legacyDrawingRId,
             registerDxf: style => this._styles.registerDxf(style),
+            sheetProtection: sheet.layout?.sheetProtection,
+            autoFilterRef: sheet.layout?.autoFilterRef,
+            tableParts: sheet.tableParts,
         });
         if (filterRange !== null) {
             this._autofilterIsOn = true;
@@ -408,6 +636,7 @@ export class XlsxWriter {
         this._streamHeadFlushed = true;
         this._streamHasHeaders = false;
         this._streamDataRows = 0;
+        this._streamTableTotals = new Map();
         this._streamAutofitRows = AUTOFIT_SAMPLE_ROWS;
     }
 
@@ -461,6 +690,39 @@ export class XlsxWriter {
             colLetters[i] = this._getColumnLetter(i);
         }
 
+        const layout = this._resolveLayout(
+            options,
+            headers !== null && headers !== undefined,
+            columnCount,
+            headers,
+            totalRows,
+        );
+        const sheet = this.sheetList[this.sheetCount - 1];
+        if (!sheet) {
+            throw new Error('Call addSheet() before writeSheet()');
+        }
+        sheet.layout = layout;
+        const totalsOverrides = tableTotalsOverrides(layout.tables);
+        if (totalsOverrides.length > 0) {
+            const headerOffset = headers ? 1 : 0;
+            const byRow = new Map<number, TableTotalsOverride[]>();
+            for (const override of totalsOverrides) {
+                const index = override.row - headerOffset;
+                if (index < 0 || index >= rows.length) {
+                    throw new Error(
+                        `Table totals row ${override.row + 1} is outside the written rows `
+                        + `(the sheet has ${totalRows} rows)`,
+                    );
+                }
+                const list = byRow.get(index) ?? [];
+                list.push(override);
+                byRow.set(index, list);
+            }
+            for (const [index, list] of byRow) {
+                rows[index] = withTableTotals(rows[index], list);
+            }
+        }
+
         const colWidths = this._resolveColumnWidths(
             columnCount,
             headers,
@@ -478,36 +740,51 @@ export class XlsxWriter {
             isFirstSheet: this.sheetCount === 1,
             hasHeaders: headers !== null && headers !== undefined,
             colWidths,
+            freezePanes: layout.freezePanes,
+            showGridLines: layout.showGridLines,
+            showRowColHeaders: layout.showRowColHeaders,
+            showZeroValues: layout.showZeroValues,
+            rightToLeft: layout.rightToLeft,
+            zoom: layout.zoom,
+            tabColor: layout.tabColor,
+            hiddenColumns: layout.hiddenColumns,
+            columnOutline: layout.columnOutline,
         });
 
         let rowNum = 0;
 
         if (headers) {
             rowNum++;
-            bigBuf.writeString(`<row r="${rowNum}">`);
+            bigBuf.writeString(`<row r="${rowNum}"${xlsxRowAttributes(0, layout)}>`);
+            const headerStyle = this._headerStyleIndex(layout);
+            const baseHeader = mergeCellStyles({ font: { bold: true } }, layout.headerStyle);
             // Headers are contiguous from column A, so no cell needs `r`.
             for (let c = 0; c < headers.length; c++) {
-                this._writeStringCell(bigBuf, headers[c], '', 3);
+                const rangeStyle = layout.styleRanges.styleFor(0, c);
+                const style = rangeStyle
+                    ? this._styles.register(mergeCellStyles(baseHeader, rangeStyle))
+                    : headerStyle;
+                this._writeStringCell(bigBuf, headers[c], '', style);
             }
             bigBuf.writeString('</row>');
         }
 
         for (let r = 0; r < rows.length; r++) {
             rowNum++;
-            bigBuf.writeString(`<row r="${rowNum}">`);
+            const sheetRow = rowNum - 1;
+            bigBuf.writeString(`<row r="${rowNum}"${xlsxRowAttributes(sheetRow, layout)}>`);
             const row = rows[r];
             let prevCol = -1;
             for (let c = 0; c < row.length; c++) {
-                prevCol = writeXlsxCell(bigBuf, this, row[c], c, prevCol, colLetters[c], rowNum);
+                const rangeStyle = layout.styleRanges.styleFor(sheetRow, c);
+                prevCol = writeXlsxCell(
+                    bigBuf, this, row[c], c, prevCol, colLetters[c], rowNum, 1, 2, rangeStyle,
+                );
             }
             bigBuf.writeString('</row>');
         }
 
-        const sheet = this.sheetList[this.sheetCount - 1];
-        if (!sheet) {
-            throw new Error('Call addSheet() before writeSheet()');
-        }
-        this._applySheetFeatures(sheet, options);
+        this._applySheetFeatures(sheet, options, layout);
 
         const filterRange = writeXlsxSheetTail(bigBuf, {
             doAutofilter: doAutofilter && headers !== null && headers !== undefined,
@@ -521,6 +798,9 @@ export class XlsxWriter {
             conditionalFormats: sheet.conditionalFormats,
             legacyDrawingRId: sheet.legacyDrawingRId,
             registerDxf: style => this._styles.registerDxf(style),
+            sheetProtection: layout.sheetProtection,
+            autoFilterRef: layout.autoFilterRef,
+            tableParts: sheet.tableParts,
         });
         if (filterRange !== null) {
             this._autofilterIsOn = true;
@@ -658,8 +938,11 @@ export class XlsxWriter {
         const commentParts = this.sheetList
             .filter(sheet => (sheet.comments?.length ?? 0) > 0)
             .map(sheet => ({ path: `xl/comments/sheet${sheet.sheetId}.xml` }));
+        const tableParts = this.sheetList.flatMap(sheet =>
+            (sheet.tableParts ?? []).map(part => ({ path: part.path })),
+        );
         this.archive.append(
-            buildXlsxContentTypes(this.sheetList, commentParts),
+            buildXlsxContentTypes(this.sheetList, commentParts, tableParts),
             { name: '[Content_Types].xml' },
         );
     }

@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
-import { describe, it, before } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { XlsxWriter } from '../../src/XlsxWriter';
 import { XlsbWriter } from '../../src/XlsbWriter';
@@ -79,6 +79,7 @@ const ROWS: CellValue[][] = [
 ];
 
 const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spreadsheet-stage2-com-'));
+after(() => fs.rmSync(workDir, { recursive: true, force: true }));
 
 async function writeXlsx(): Promise<string> {
     const file = path.join(workDir, 'stage2.xlsx');

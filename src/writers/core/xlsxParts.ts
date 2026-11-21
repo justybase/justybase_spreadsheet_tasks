@@ -21,6 +21,7 @@ import {
     getCellStyle,
     getFormula,
     isRichText,
+    mergeCellStyles,
     unwrapCell,
 } from '../../Formats';
 import {
@@ -31,6 +32,18 @@ import {
 } from '../../writerHelpers';
 import { escapeXmlText, escapeXlsxText } from '../../xmlUtils';
 import { TextByteSink } from './ByteSink';
+import {
+    FreezePane,
+    GroupSpec,
+    NormalizedTableSpec,
+    Outline,
+    SheetProtectionSpec,
+    TableSpec,
+    colorKey as sharedColorKey,
+    passwordHash,
+    tableAutoFilterRef,
+    validateZoom,
+} from './sheetLayout';
 
 export interface XlsxSheetEntry {
     name: string;
@@ -77,17 +90,7 @@ const HORIZONTAL_ALIGNMENTS = new Set([
 const VERTICAL_ALIGNMENTS = new Set(['top', 'center', 'bottom', 'justify', 'distributed']);
 
 function colorKey(color: StyleColor): string {
-    if (typeof color === 'string') {
-        let value = color.trim().replace(/^#/, '').toUpperCase();
-        if (value.length === 6) value = `FF${value}`;
-        if (!/^[0-9A-F]{8}$/.test(value)) {
-            throw new Error(`Invalid color '${color}'. Use RRGGBB, AARRGGBB or '#' + hex.`);
-        }
-        return `rgb:${value}`;
-    }
-    if ('indexed' in color) return `indexed:${color.indexed}`;
-    const tint = color.tint ?? 0;
-    return `theme:${color.theme}:${tint}`;
+    return sharedColorKey(color);
 }
 
 function colorXml(color: StyleColor | undefined): string {
@@ -96,6 +99,7 @@ function colorXml(color: StyleColor | undefined): string {
         const key = colorKey(color);
         return `<color rgb="${key.slice(4)}"/>`;
     }
+    if ('auto' in color) return '<color auto="1"/>';
     if ('indexed' in color) return `<color indexed="${color.indexed}"/>`;
     const tint = color.tint;
     return `<color theme="${color.theme}"${tint !== undefined ? ` tint="${tint}"` : ''}/>`;
@@ -130,6 +134,33 @@ function normalizeFont(font: FontStyle | undefined): FontStyle | null {
 
 function normalizeFill(fill: FillStyle | undefined): FillStyle | null {
     if (!fill) return null;
+    if (fill.gradient !== undefined) {
+        const gradient = fill.gradient;
+        const type = gradient.type ?? 'linear';
+        if (type !== 'linear' && type !== 'path') {
+            throw new Error(`Unknown gradient fill type '${type}'`);
+        }
+        if (!Array.isArray(gradient.stops) || gradient.stops.length < 2) {
+            throw new Error('A gradient fill needs at least two stops');
+        }
+        const stops = gradient.stops.map(stop => {
+            if (!Number.isFinite(stop.position) || stop.position < 0 || stop.position > 1) {
+                throw new RangeError(`Gradient stop position must be 0..1, got ${stop.position}`);
+            }
+            return { color: stop.color, position: stop.position };
+        });
+        if (gradient.degree !== undefined
+            && (!Number.isFinite(gradient.degree) || gradient.degree < 0 || gradient.degree > 360)) {
+            throw new RangeError(`Gradient degree must be 0..360, got ${gradient.degree}`);
+        }
+        for (const side of ['left', 'right', 'top', 'bottom'] as const) {
+            const value = gradient[side];
+            if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 1)) {
+                throw new RangeError(`Gradient ${side} must be 0..1, got ${value}`);
+            }
+        }
+        return { gradient: { ...gradient, type, stops } };
+    }
     const out: FillStyle = {};
     if (fill.patternType !== undefined) {
         if (!PATTERN_TYPES.has(fill.patternType)) throw new Error(`Unknown fill pattern '${fill.patternType}'`);
@@ -156,7 +187,7 @@ function normalizeBorderSide(side: BorderSide | undefined): BorderSide | null {
 function normalizeBorder(border: BorderStyle | undefined): BorderStyle | null {
     if (!border) return null;
     const out: BorderStyle = {};
-    for (const name of ['top', 'bottom', 'left', 'right', 'diagonal'] as const) {
+    for (const name of ['top', 'bottom', 'left', 'right', 'diagonal', 'start', 'end', 'vertical', 'horizontal'] as const) {
         const side = normalizeBorderSide(border[name]);
         if (side) out[name] = side;
     }
@@ -196,6 +227,12 @@ function normalizeAlignment(alignment: AlignmentStyle | undefined): AlignmentSty
         }
         out.textRotation = rotation;
     }
+    if (alignment.relativeIndent !== undefined) {
+        if (!Number.isInteger(alignment.relativeIndent) || alignment.relativeIndent < -250 || alignment.relativeIndent > 250) {
+            throw new RangeError(`alignment.relativeIndent must be -250..250, got ${alignment.relativeIndent}`);
+        }
+        out.relativeIndent = alignment.relativeIndent;
+    }
     if (alignment.justifyLastLine) out.justifyLastLine = true;
     if (alignment.readingOrder !== undefined) out.readingOrder = alignment.readingOrder;
     return Object.keys(out).length > 0 ? out : null;
@@ -224,6 +261,8 @@ export function normalizeStyle(style: CellStyle | null | undefined): CellStyle |
     if (border) out.border = border;
     if (alignment) out.alignment = alignment;
     if (protection) out.protection = protection;
+    if (style.quotePrefix) out.quotePrefix = true;
+    if (style.pivotButton) out.pivotButton = true;
     return Object.keys(out).length > 0 ? out : null;
 }
 
@@ -247,28 +286,43 @@ const BASE_XFS = [
 ];
 
 function fontXml(font: FontStyle): string {
+    // CT_Font sequence: b, i, strike, condense, extend, outline, shadow, u,
+    // vertAlign, sz, color, name, family, charset, scheme.
     let xml = '<font>';
-    if (font.name !== undefined) xml += `<name val="${escapeXlsxAttribute(font.name)}"/>`;
-    if (font.charset !== undefined) xml += `<charset val="${font.charset}"/>`;
-    if (font.family !== undefined) xml += `<family val="${font.family}"/>`;
     if (font.bold) xml += '<b/>';
     if (font.italic) xml += '<i/>';
     if (font.strike) xml += '<strike/>';
-    if (font.outline) xml += '<outline/>';
-    if (font.shadow) xml += '<shadow/>';
     if (font.condense) xml += '<condense/>';
     if (font.extend) xml += '<extend/>';
-    if (font.color !== undefined) xml += colorXml(font.color);
-    if (font.size !== undefined) xml += `<sz val="${font.size}"/>`;
+    if (font.outline) xml += '<outline/>';
+    if (font.shadow) xml += '<shadow/>';
     if (font.underline !== undefined) {
         xml += font.underline === 'single' ? '<u/>' : `<u val="${font.underline}"/>`;
     }
     if (font.vertAlign !== undefined) xml += `<vertAlign val="${font.vertAlign}"/>`;
+    if (font.size !== undefined) xml += `<sz val="${font.size}"/>`;
+    if (font.color !== undefined) xml += colorXml(font.color);
+    if (font.name !== undefined) xml += `<name val="${escapeXlsxAttribute(font.name)}"/>`;
+    if (font.family !== undefined) xml += `<family val="${font.family}"/>`;
+    if (font.charset !== undefined) xml += `<charset val="${font.charset}"/>`;
     if (font.scheme !== undefined) xml += `<scheme val="${font.scheme}"/>`;
     return `${xml}</font>`;
 }
 
 function fillXml(fill: FillStyle): string {
+    if (fill.gradient) {
+        const gradient = fill.gradient;
+        let attrs = ` type="${gradient.type ?? 'linear'}"`;
+        if (gradient.degree !== undefined) attrs += ` degree="${gradient.degree}"`;
+        for (const side of ['left', 'right', 'top', 'bottom'] as const) {
+            if (gradient[side] !== undefined) attrs += ` ${side}="${gradient[side]}"`;
+        }
+        let xml = `<fill><gradientFill${attrs}>`;
+        for (const stop of gradient.stops) {
+            xml += `<stop position="${stop.position}">${colorXml(stop.color)}</stop>`;
+        }
+        return `${xml}</gradientFill></fill>`;
+    }
     const pattern = fill.patternType ?? 'solid';
     let xml = `<fill><patternFill patternType="${pattern}">`;
     if (fill.fgColor !== undefined) xml += colorXml(fill.fgColor).replace('<color', '<fgColor');
@@ -291,11 +345,18 @@ function borderXml(border: BorderStyle): string {
     if (border.diagonalDown) xml += ' diagonalDown="1"';
     if (border.outline === false) xml += ' outline="0"';
     xml += '>';
+    // CT_Border sequence: start, end, left, right, top, bottom, diagonal,
+    // vertical, horizontal. An empty start/end would override explicit
+    // left/right in Excel, so the logical sides are written only when set.
+    if (border.start !== undefined) xml += borderSideXml('start', border.start);
+    if (border.end !== undefined) xml += borderSideXml('end', border.end);
     xml += borderSideXml('left', border.left);
     xml += borderSideXml('right', border.right);
     xml += borderSideXml('top', border.top);
     xml += borderSideXml('bottom', border.bottom);
     xml += borderSideXml('diagonal', border.diagonal);
+    if (border.vertical !== undefined) xml += borderSideXml('vertical', border.vertical);
+    if (border.horizontal !== undefined) xml += borderSideXml('horizontal', border.horizontal);
     return `${xml}</border>`;
 }
 
@@ -306,6 +367,7 @@ function alignmentXml(alignment: AlignmentStyle): string {
     if (alignment.wrapText) xml += ' wrapText="1"';
     if (alignment.shrinkToFit) xml += ' shrinkToFit="1"';
     if (alignment.indent !== undefined) xml += ` indent="${alignment.indent}"`;
+    if (alignment.relativeIndent !== undefined) xml += ` relativeIndent="${alignment.relativeIndent}"`;
     if (alignment.textRotation !== undefined) xml += ` textRotation="${alignment.textRotation}"`;
     if (alignment.justifyLastLine) xml += ' justifyLastLine="1"';
     if (alignment.readingOrder !== undefined) xml += ` readingOrder="${alignment.readingOrder}"`;
@@ -323,6 +385,17 @@ function protectionXml(protection: ProtectionStyle): string {
  * Differential style for conditional formatting. Fills use the background
  * color, which is how Excel stores conditional-format highlighting.
  */
+function dxfFillXml(fill: FillStyle): string {
+    if (fill.gradient) return fillXml(fill);
+    const pattern = fill.patternType ?? 'solid';
+    if (pattern !== 'solid') return fillXml(fill);
+    // A differential solid fill stores its visible colour in bgColor; Excel
+    // ignores fgColor here and would otherwise paint the cell black.
+    const color = fill.bgColor ?? fill.fgColor;
+    if (color === undefined) return fillXml(fill);
+    return `<fill><patternFill patternType="solid">${colorXml(color).replace('<color', '<bgColor')}</patternFill></fill>`;
+}
+
 function dxfXml(style: CellStyle, numFmtId: number | null): string {
     let xml = '<dxf>';
     if (style.font) xml += fontXml(style.font);
@@ -330,10 +403,7 @@ function dxfXml(style: CellStyle, numFmtId: number | null): string {
         xml += `<numFmt numFmtId="${numFmtId}" formatCode="${escapeXlsxAttribute(style.numFmt)}"/>`;
     }
     if (style.fill) {
-        const color = style.fill.bgColor ?? style.fill.fgColor;
-        xml += '<fill><patternFill>';
-        if (color !== undefined) xml += colorXml(color).replace('<color', '<bgColor');
-        xml += '</patternFill></fill>';
+        xml += dxfFillXml(style.fill);
     }
     if (style.alignment) xml += alignmentXml(style.alignment);
     if (style.border) xml += borderXml(style.border);
@@ -427,6 +497,8 @@ export class XlsxStyleRegistry {
         if (borderId !== 0) xf += ' applyBorder="1"';
         if (normalized.alignment) xf += ' applyAlignment="1"';
         if (normalized.protection) xf += ' applyProtection="1"';
+        if (normalized.quotePrefix) xf += ' quotePrefix="1"';
+        if (normalized.pivotButton) xf += ' pivotButton="1"';
         const children = (normalized.alignment ? alignmentXml(normalized.alignment) : '')
             + (normalized.protection ? protectionXml(normalized.protection) : '');
         if (children) {
@@ -572,6 +644,7 @@ export function buildXlsxWorkbook(sheets: XlsxSheetEntry[], autofilterOn: boolea
 export function buildXlsxContentTypes(
     sheets: XlsxSheetEntry[],
     comments?: Array<{ path: string }>,
+    tables?: Array<{ path: string }>,
 ): string {
     let xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -586,6 +659,9 @@ ${comments && comments.length > 0 ? '<Default Extension="vml" ContentType="appli
     }
     for (const part of comments ?? []) {
         xml += `<Override PartName="/${part.path}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>`;
+    }
+    for (const part of tables ?? []) {
+        xml += `<Override PartName="/${part.path}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>`;
     }
     xml += '</Types>';
     return xml;
@@ -609,6 +685,32 @@ export function buildXlsxRels(sheets: XlsxSheetEntry[]): { global: string; workb
     return { global, workbook };
 }
 
+export interface XlsxRowLayout {
+    rowHeights?: Record<number, number>;
+    hiddenRows?: Set<number>;
+    rowOutline?: Outline;
+}
+
+/** Attributes for `<row>` (0-based row index). */
+export function xlsxRowAttributes(rowIndex: number, layout: XlsxRowLayout | undefined): string {
+    if (!layout) return '';
+    let attrs = '';
+    const height = layout.rowHeights?.[rowIndex];
+    if (height !== undefined) {
+        attrs += ` ht="${height}" customHeight="1"`;
+    }
+    const outline = layout.rowOutline;
+    const outlineHidden = outline !== undefined
+        && rowIndex < outline.hidden.length
+        && outline.hidden[rowIndex] === 1;
+    if (layout.hiddenRows?.has(rowIndex) || outlineHidden) attrs += ' hidden="1"';
+    if (outline && rowIndex < outline.level.length) {
+        if (outline.level[rowIndex] > 0) attrs += ` outlineLevel="${outline.level[rowIndex]}"`;
+        if (outline.collapsed[rowIndex]) attrs += ' collapsed="1"';
+    }
+    return attrs;
+}
+
 /**
  * Write everything up to and including `<sheetData>`. The caller writes the
  * header row and data rows, then calls {@link writeXlsxSheetTail}.
@@ -621,28 +723,68 @@ export function writeXlsxSheetHead(
         isFirstSheet: boolean;
         hasHeaders: boolean;
         colWidths: number[];
+        freezePanes?: FreezePane | null;
+        showGridLines?: boolean;
+        showRowColHeaders?: boolean;
+        showZeroValues?: boolean;
+        rightToLeft?: boolean;
+        zoom?: number;
+        tabColor?: StyleColor;
+        hiddenColumns?: number[];
+        columnOutline?: Outline;
     },
 ): void {
-    const { dimensionRef, columnCount, isFirstSheet, hasHeaders, colWidths } = options;
+    const {
+        dimensionRef, columnCount, isFirstSheet, colWidths,
+        freezePanes = null, showGridLines = true, showRowColHeaders = true,
+        showZeroValues = true, rightToLeft = false, zoom, tabColor,
+        hiddenColumns = [], columnOutline,
+    } = options;
 
     sink.writeString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
     sink.writeString('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">');
+    if (tabColor !== undefined) {
+        sink.writeString(`<sheetPr><tabColor ${colorXml(tabColor).replace(/^<color /, '').replace(/\/>$/, '')}/></sheetPr>`);
+    }
     sink.writeString(`<dimension ref="${dimensionRef}"/>`);
 
-    if (hasHeaders) {
-        sink.writeString(isFirstSheet
-            ? '<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" /><selection pane="bottomLeft" /></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>'
-            : '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" /><selection pane="bottomLeft" /></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
+    let viewAttrs = '';
+    if (isFirstSheet) viewAttrs += ' tabSelected="1"';
+    if (!showGridLines) viewAttrs += ' showGridLines="0"';
+    if (!showRowColHeaders) viewAttrs += ' showRowColHeaders="0"';
+    if (!showZeroValues) viewAttrs += ' showZeros="0"';
+    if (rightToLeft) viewAttrs += ' rightToLeft="1"';
+    if (zoom !== undefined) viewAttrs += ` zoomScale="${validateZoom(zoom)}"`;
+    viewAttrs += ' workbookViewId="0"';
+
+    sink.writeString('<sheetViews>');
+    if (freezePanes) {
+        const pane = freezePanes;
+        sink.writeString(`<sheetView${viewAttrs}>`);
+        sink.writeString(`<pane${pane.xSplit ? ` xSplit="${pane.xSplit}"` : ''}${pane.ySplit ? ` ySplit="${pane.ySplit}"` : ''} topLeftCell="${pane.topLeftCell}" activePane="${pane.activePane}" state="frozen"/>`);
+        sink.writeString(`<selection pane="${pane.activePane}" activeCell="${pane.topLeftCell}" sqref="${pane.topLeftCell}"/>`);
+        sink.writeString('</sheetView>');
     } else {
-        sink.writeString(isFirstSheet
-            ? '<sheetViews><sheetView tabSelected="1" workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>'
-            : '<sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>');
+        sink.writeString(`<sheetView${viewAttrs}/>`);
     }
+    sink.writeString('</sheetViews>');
+
+    let formatPr = '<sheetFormatPr defaultRowHeight="15"';
+    if (columnOutline && columnOutline.maxLevel > 0) formatPr += ` outlineLevelCol="${columnOutline.maxLevel}"`;
+    formatPr += '/>';
+    sink.writeString(formatPr);
 
     sink.writeString('<cols>');
+    const hidden = new Set(hiddenColumns);
     for (let i = 0; i < columnCount; i++) {
         const width = defaultColWidth(colWidths[i]);
-        sink.writeString(`<col min="${i + 1}" max="${i + 1}" width="${formatColumnWidth(width)}" bestFit="1" customWidth="1" />`);
+        let attrs = `min="${i + 1}" max="${i + 1}" width="${formatColumnWidth(width)}" bestFit="1" customWidth="1"`;
+        if (hidden.has(i)) attrs += ' hidden="1"';
+        if (columnOutline && i < columnOutline.level.length && columnOutline.level[i] > 0) {
+            attrs += ` outlineLevel="${columnOutline.level[i]}"`;
+            if (columnOutline.collapsed[i]) attrs += ' collapsed="1"';
+        }
+        sink.writeString(`<col ${attrs}/>`);
     }
     sink.writeString('</cols><sheetData>');
 }
@@ -667,20 +809,32 @@ export function writeXlsxSheetTail(
         cfPriorityStart?: number;
         /** Register a differential style for conditional formatting. */
         registerDxf?: (style: CellStyle) => number;
+        sheetProtection?: SheetProtectionSpec;
+        autoFilterRef?: string;
+        tableParts?: Array<{ rId: string }>;
     },
 ): string | null {
     const {
         doAutofilter, columnCount, lastColumnLetter, rowNum, sheetName,
         merges, hyperlinks, dataValidations, conditionalFormats,
         legacyDrawingRId, cfPriorityStart = 1, registerDxf,
+        sheetProtection, autoFilterRef, tableParts,
     } = options;
     sink.writeString('</sheetData>');
 
+    if (sheetProtection) sink.writeString(buildXlsxSheetProtection(sheetProtection));
+
     let filterRange: string | null = null;
     if (doAutofilter && columnCount > 0) {
-        const ref = `A1:${lastColumnLetter}${rowNum}`;
-        sink.writeString(`<autoFilter ref="${ref}"/>`);
-        filterRange = `${formatSheetNameForFormula(sheetName)}!$A$1:$${lastColumnLetter}$${rowNum}`;
+        let ref = `A1:${lastColumnLetter}${rowNum}`;
+        if (autoFilterRef !== undefined) ref = autoFilterRef;
+        sink.writeString(`<autoFilter ref="${escapeXmlText(ref)}"/>`);
+        const name = autoFilterRef !== undefined
+            ? autoFilterRef.replace(/\$?([A-Za-z]{1,3})\$?([0-9]+)/g, '$1$2')
+            : `A1:${lastColumnLetter}${rowNum}`;
+        const absolute = name.replace(/^([A-Za-z]+)(\d+)/, '$$$1$$$2')
+            .replace(/:([A-Za-z]+)(\d+)$/, ':$$$1$$$2');
+        filterRange = `${formatSheetNameForFormula(sheetName)}!${absolute}`;
     }
 
     if (merges && merges.length > 0) {
@@ -699,6 +853,11 @@ export function writeXlsxSheetTail(
     }
     if (legacyDrawingRId) {
         sink.writeString(`<legacyDrawing r:id="${legacyDrawingRId}"/>`);
+    }
+    if (tableParts && tableParts.length > 0) {
+        sink.writeString(`<tableParts count="${tableParts.length}">`);
+        for (const part of tableParts) sink.writeString(`<tablePart r:id="${part.rId}"/>`);
+        sink.writeString('</tableParts>');
     }
 
     sink.writeString('</worksheet>');
@@ -778,6 +937,85 @@ export function buildXlsxSheetRels(
 export const XLSX_REL_HYPERLINK = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink';
 export const XLSX_REL_VML = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing';
 export const XLSX_REL_COMMENTS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments';
+export const XLSX_REL_TABLE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/table';
+
+/** Build one `xl/tables/tableN.xml` part. */
+export function buildXlsxTableXml(table: NormalizedTableSpec, tableId: number): string {
+    const totals = table.totalsRow ? ' totalsRowCount="1" totalsRowShown="1"' : '';
+    const headerCount = table.headerRow ? '1' : '0';
+    const filterRef = tableAutoFilterRef(table);
+    const auto = filterRef ? `<autoFilter ref="${escapeXmlText(filterRef)}"/>` : '';
+    const columns = table.columns.map((column, index) => {
+        let attrs = `id="${index + 1}" name="${escapeXlsxAttribute(column.name)}"`;
+        let child = '';
+        if (table.totalsRow) {
+            const fn = column.totalsRowFunction;
+            if (fn === 'custom') {
+                attrs += ' totalsRowFunction="custom"';
+                child = `<totalsRowFormula>${escapeXmlText(column.totalsRowFormula ?? '')}</totalsRowFormula>`;
+            } else if (fn !== undefined) {
+                attrs += ` totalsRowFunction="${fn}"`;
+            } else if (column.totalsRowLabel !== undefined) {
+                attrs += ` totalsRowLabel="${escapeXlsxAttribute(column.totalsRowLabel)}"`;
+            }
+        }
+        return child
+            ? `<tableColumn ${attrs}>${child}</tableColumn>`
+            : `<tableColumn ${attrs}/>`;
+    }).join('');
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        + '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        + `id="${tableId}" name="${escapeXlsxAttribute(table.name)}" `
+        + `displayName="${escapeXlsxAttribute(table.name)}" ref="${table.refText}"${totals} `
+        + `headerRowCount="${headerCount}">${auto}`
+        + `<tableColumns count="${table.columns.length}">${columns}</tableColumns>`
+        + '<tableStyleInfo '
+        + `name="${escapeXlsxAttribute(table.styleName)}" `
+        + `showFirstColumn="${table.showFirstColumn ? 1 : 0}" `
+        + `showLastColumn="${table.showLastColumn ? 1 : 0}" `
+        + `showRowStripes="${table.showRowStripes ? 1 : 0}" `
+        + `showColumnStripes="${table.showColumnStripes ? 1 : 0}"/>`
+        + '</table>';
+}
+
+export function buildXlsxSheetProtection(protection: SheetProtectionSpec): string {
+    if (protection.enabled === false) return '';
+    // Selection flags mean "allow selection" (xlspy API); the OOXML attribute
+    // is inverted. Lock flags mean "block the action" and are written as 1.
+    const selection = (value: boolean | undefined) => (value === false ? '1' : '0');
+    let xml = '<sheetProtection sheet="1"'
+        + ` objects="${protection.objects === false ? 0 : 1}"`
+        + ` scenarios="${protection.scenarios === false ? 0 : 1}"`;
+    if (protection.password) {
+        // The legacy password verifier is exactly two bytes (four hex digits).
+        xml += ` password="${passwordHash(protection.password).toString(16).toUpperCase().padStart(4, '0')}"`;
+    }
+    if (protection.selectLockedCells !== undefined) {
+        xml += ` selectLockedCells="${selection(protection.selectLockedCells)}"`;
+    }
+    if (protection.selectUnlockedCells !== undefined) {
+        xml += ` selectUnlockedCells="${selection(protection.selectUnlockedCells)}"`;
+    }
+    const locks: Array<[string, boolean | undefined]> = [
+        ['formatCells', protection.formatCells],
+        ['formatColumns', protection.formatColumns],
+        ['formatRows', protection.formatRows],
+        ['insertColumns', protection.insertColumns],
+        ['insertRows', protection.insertRows],
+        ['insertHyperlinks', protection.insertHyperlinks],
+        ['deleteColumns', protection.deleteColumns],
+        ['deleteRows', protection.deleteRows],
+        ['sort', protection.sort],
+        ['autoFilter', protection.autoFilter],
+        ['pivotTables', protection.pivotTables],
+    ];
+    for (const [name, value] of locks) {
+        // true blocks the action, false explicitly allows it; omitting an
+        // attribute keeps Excel's default (blocked).
+        if (value !== undefined) xml += ` ${name}="${value ? 1 : 0}"`;
+    }
+    return `${xml}/>`;
+}
 export function writeXlsxSharedStringCell(
     sink: TextByteSink,
     sst: { values: SharedStringValue[]; index: Map<string, number> },
@@ -921,6 +1159,36 @@ export interface XlsxSheetFeatures {
     comments?: CommentSpec[];
 }
 
+/** Layout options shared by the XLSX and XLSB sheet APIs. */
+export interface SheetLayoutOptions {
+    /** Style applied to every cell of the header row(s). */
+    headerStyle?: CellStyle;
+    /** A1 range (or whole column/row) to style; later ranges win. */
+    styles?: Record<string, CellStyle>;
+    /** 0-based row index -> height in points. */
+    rowHeights?: Record<number, number>;
+    /** 0-based row indices to hide. */
+    hiddenRows?: number[];
+    /** 0-based column indices to hide. */
+    hiddenColumns?: number[];
+    rowGroups?: GroupSpec[];
+    columnGroups?: GroupSpec[];
+    /** `false` disables the freeze; a cell such as `B2` freezes above/left. */
+    freezePanes?: string | false | null;
+    showGridLines?: boolean;
+    showRowColHeaders?: boolean;
+    showZeroValues?: boolean;
+    rightToLeft?: boolean;
+    /** 10..400 percent. */
+    zoom?: number;
+    tabColor?: StyleColor;
+    sheetProtection?: SheetProtectionSpec;
+    /** Override the autofilter range instead of header row .. last row. */
+    autoFilterRef?: string;
+    /** Excel ListObject tables. */
+    tables?: TableSpec[];
+}
+
 const DV_TYPES: Record<DataValidationSpec['type'], string> = {
     whole: 'whole', decimal: 'decimal', list: 'list', date: 'date',
     time: 'time', textLength: 'textLength', custom: 'custom',
@@ -1020,11 +1288,21 @@ function writeConditionalFormatting(
                     break;
                 }
                 case 'iconSet': {
-                    let attrs = ` type="iconSet" priority="${current}"`;
-                    if (rule.showValue === false) attrs += ' showValue="0"';
-                    if (rule.reverse) attrs += ' reverse="1"';
-                    sink.writeString(`<cfRule${attrs}><iconSet iconSet="${rule.iconSet ?? '3TrafficLights1'}">`);
-                    for (const point of rule.cfvo ?? []) {
+                    const iconSet = rule.iconSet ?? '3TrafficLights1';
+                    const iconCount = iconSet.startsWith('5') ? 5 : iconSet.startsWith('4') ? 4 : 3;
+                    const defaults = Array.from({ length: iconCount - 1 }, (_, index) => ({
+                        type: 'percent' as const,
+                        value: String(Math.round(((index + 1) * 100) / iconCount)),
+                    }));
+                    const supplied = rule.cfvo ?? [];
+                    const points = supplied.length >= iconCount - 1
+                        ? supplied.slice(0, iconCount - 1)
+                        : [...supplied, ...defaults.slice(supplied.length)];
+                    let iconAttrs = ` iconSet="${iconSet}"`;
+                    if (rule.showValue === false) iconAttrs += ' showValue="0"';
+                    if (rule.reverse) iconAttrs += ' reverse="1"';
+                    sink.writeString(`<cfRule type="iconSet" priority="${current}"><iconSet${iconAttrs}>`);
+                    for (const point of points) {
                         sink.writeString(`<cfvo type="${point.type}"${point.value !== undefined ? ` val="${escapeXmlText(point.value)}"` : ''}/>`);
                     }
                     sink.writeString('</iconSet></cfRule>');
@@ -1050,7 +1328,15 @@ function writeConditionalFormatting(
                         : rule.type === 'notContainsText' ? 'notContains'
                         : rule.type === 'beginsWith' ? 'beginsWith' : 'endsWith';
                     const escaped = rule.text.replace(/"/g, '""');
-                    sink.writeString(`<cfRule type="${rule.type}" operator="${operator}" text="${escapeXlsxAttribute(rule.text)}" priority="${current}"${dxfAttr}><formula>${escapeXmlText(`NOT(ISERROR(SEARCH("${escaped}",${firstCell})))`)}</formula></cfRule>`);
+                    const quoted = `"${escaped}"`;
+                    const formula = rule.type === 'containsText'
+                        ? `NOT(ISERROR(SEARCH(${quoted},${firstCell})))`
+                        : rule.type === 'notContainsText'
+                            ? `ISERROR(SEARCH(${quoted},${firstCell}))`
+                            : rule.type === 'beginsWith'
+                                ? `LEFT(${firstCell},${rule.text.length})=${quoted}`
+                                : `RIGHT(${firstCell},${rule.text.length})=${quoted}`;
+                    sink.writeString(`<cfRule type="${rule.type}" operator="${operator}" text="${escapeXlsxAttribute(rule.text)}" priority="${current}"${dxfAttr}><formula>${escapeXmlText(formula)}</formula></cfRule>`);
                     break;
                 }
             }
@@ -1138,10 +1424,12 @@ export function writeXlsxCell(
     rowNum: number,
     dateStyle: number = 1,
     dateTimeStyle: number = 2,
+    extraStyle?: CellStyle | null,
 ): number {
     if (raw === null || raw === undefined) return prevCol;
 
-    const style = getCellStyle(raw);
+    const cellStyle = getCellStyle(raw);
+    const style = extraStyle ? mergeCellStyles(cellStyle, extraStyle) : cellStyle;
     const xfIdx = style !== null ? context.registerStyle(style) : -1;
     const styleAttr = xfIdx > 0 ? ` s="${xfIdx}"` : '';
     const ref = cellRefAttr(col, prevCol, colLetter, rowNum);

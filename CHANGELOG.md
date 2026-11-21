@@ -5,6 +5,65 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-11-21
+
+### Added
+
+- Shared `SheetLayoutOptions` for both writers: header and A1/row/column range
+  styles, row heights, hidden rows/columns, outline groups, freeze panes,
+  sheet-view flags, zoom, tab colours, autofilter ranges and sheet protection.
+- Excel ListObject tables in XLSX (`xl/tables/*.xml`) and XLSB
+  (`xl/tables/*.bin`), including table styles, totals rows, custom formulas and
+  worksheet list-part records.
+- XLSB conditional formatting (cell, expression, top/bottom, duplicate/unique,
+  text, colour scale, data bar and icon set) with differential styles written
+  into `styles.bin`.
+- XLSB classic comments with authors, VML drawings and deterministic GUIDs.
+- XLSB rich-text shared strings, including registered run fonts.
+- Gradient fills and the full OpenXML border side set; XLSB rejects the border
+  sides and alignment features it cannot encode.
+- `quotePrefix`, `pivotButton`, `relativeIndent` and component-wise
+  `mergeCellStyles` support.
+- Table, comment, conditional-format, protection and layout coverage in the
+  browser demo/test pages.
+- `ultimate-styles.xlsb` downloads in the browser demo and test pages, showing
+  the full XLSB-supported style set (gradients, font decorations, diagonal
+  borders, alignment, protection and number formats). The XLSX file keeps the
+  OOXML-only logical border sides and `relativeIndent`.
+
+### Fixed
+
+- XLSB sheet-protection flags now block unspecified actions like the OOXML
+  defaults; only an explicit `false` allows an action. The Node and browser
+  writers match Excel's behaviour for `insertRows`, formatting and selection.
+- XLSB workbooks now include the standard Office theme, so Excel shows the
+  Calibri font declared by the writers instead of inheriting the application
+  default (Aptos Narrow in Microsoft 365).
+- `quotePrefix` and `pivotButton` are now rejected for XLSB instead of being
+  silently ignored; both are OOXML-only cell flags. The demo pages keep them in
+  the XLSX ultimate-styles file and use the XLSB-supported subset in the new
+  XLSB counterpart.
+- XLSX differential fills store conditional-format colours in `bgColor` (the
+  slot Excel reads), and empty `start`/`end` border elements no longer override
+  explicit `left`/`right` borders.
+- XLSB date-only and date-time cells now use the correct base XF, so times are
+  no longer dropped from date-time values.
+- XLSB conditional-format priorities restart at 1 on every worksheet, matching
+  XLSX and Excel's per-sheet scoping.
+- XLSX rows no longer emit a duplicate `hidden` attribute when an explicit
+  hidden row is also part of an outline group.
+- XLSX view attribute order (`tabSelected`, view flags, `workbookViewId`) is
+  schema-compatible.
+
+### Tests
+
+- Broad Excel COM verification of every download produced by `browser/demo.html`
+  and `browser/test.html`, including sheet structure, tables, totals formulas,
+  conditional-format priorities, comments, protection and validations.
+- Regression tests for table-name validation, generated totals formulas, icon
+  thresholds, data-validation operators, password hashes and origin-relative
+  formula tokens.
+
 ## [3.2.1] - 2026-11-11
 
 ### Changed

@@ -17,9 +17,9 @@ function decodeBase64(base64: string): Uint8Array {
 
 /**
  * Base `xl/styles.bin`: 2 fonts, 2 fills, 1 border, 6 cell XFs
- * (normal, date, datetime, bold, fill, bold+fill), and the two custom date
- * formats (164, 166). Custom cell formats are appended by
- * {@link buildXlsbStylesBin}.
+ * (normal, datetime, date, bold, fill, bold+fill), and the two custom date
+ * formats 164 (`yyyy-mm-dd hh:mm`) and 166 (`yyyy-mm-dd`). Custom cell formats
+ * are appended by {@link buildXlsbStylesBin}.
  */
 export const XLSB_STYLES_TEMPLATE: Uint8Array = decodeBase64(
     'lgIA5wQEAgAAACwspAATAAAAeQB5AHkAeQBcAC0AbQBtAFwALQBkAGQAXAAgAGgAaAA6AG0AbQAsHqYADAAAAHkAeQB5AHkAXAAtAG0AbQBcAC0AZABkAOgEAOMEBAIAAAArJ9wAAACQAQAAAAIAAAcBAAAAAAD/AgcAAABDAGEAbABpAGIAcgBpACsn3AABALwCAAAAAu4ABwEAAAAAAP8CBwAAAEMAYQBsAGkAYgByAGkAJQYBAAIOAICBCAAmAOQEANsEBAIAAAAtRAAAAAADQAAAAAAA/wNBAAD/////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALUQRAAAAA0AAAAAAAP8DQQAA/////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANwEAOUEBAEAAAAuMwAAAAEAAAAAAAAAAAABAAAAAAAAAAAAAQAAAAAAAAAAAAEAAAAAAAAAAAABAAAAAAAAAOYEAPIEBAEAAAAvEP//AAAAAAAAAAAAABAQAADzBADpBAQGAAAALxAAAAAAAAAAAAAAAAAQEAAALxAAAKQAAAAAAAAAAAAQEAEALxAAAKYAAAAAAAAAAAAQEAEALxAAAAAAAQAAAAAAAAAQEAEALxAAAAAAAAABAAAAAAAQEAEALxAAAAAAAQABAAAAAAAQEAEA6gQA6wQEAQAAACUGAQACEQCAgBgQAAAAAAAAAAAAAAAAAAAAACYAMBwAAAAAAQAAAAgAAABOAG8AcgBtAGEAbABuAHkA7AQA+QMEAAAAAPoDAPwDUAAAAAARAAAAVABhAGIAbABlAFMAdAB5AGwAZQBNAGUAZABpAHUAbQAyABEAAABQAGkAdgBvAHQAUwB0AHkAbABlAEwAaQBnAGgAdAAxADYA/QMAIwQCDgAA6wgA9ggqAAAAABEAAABTAGwAaQBjAGUAcgBTAHQAeQBsAGUATABpAGcAaAB0ADEA9wgA7AgAJAAjBAMPAACwEACyEDIAAAAAFQAAAFQAaQBtAGUAUwBsAGkAYwBlAHIAUwB0AHkAbABlAEwAaQBnAGgAdAAxALMQALEQACQAlwIA',
@@ -174,17 +174,44 @@ export function buildXlsbStylesBin(
     return concat(parts);
 }
 
+export interface XlsbRowHeaderOptions {
+    /** Height in twips (1/20 point). Omit for Excel's 300-twip default. */
+    heightTwips?: number;
+    hidden?: boolean;
+    outlineLevel?: number;
+    collapsed?: boolean;
+}
+
 /** BrtRowHdr (0x00), 27-byte payload. */
-export function writeXlsbRowHeader(sink: ByteSink, rowNum: number, startCol: number, endCol: number): void {
+export function writeXlsbRowHeader(
+    sink: ByteSink,
+    rowNum: number,
+    startCol: number,
+    endCol: number,
+    options: XlsbRowHeaderOptions = {},
+): void {
+    const {
+        heightTwips = 300,
+        hidden = false,
+        outlineLevel = 0,
+        collapsed = false,
+    } = options;
+    if (outlineLevel < 0 || outlineLevel > 7) {
+        throw new RangeError(`XLSB outline level must be 0..7, got ${outlineLevel}`);
+    }
+    const flags = (heightTwips !== 300 ? 0x20 : 0)
+        | (hidden ? 0x10 : 0)
+        | (collapsed ? 0x08 : 0)
+        | outlineLevel;
     sink.ensureCapacity(27);
     sink.writeUnsafeByte(0);
     sink.writeUnsafeByte(25);
     sink.writeUnsafeInt32LE(rowNum);
     sink.writeUnsafeInt32LE(0);
-    sink.writeUnsafeByte(44);
-    sink.writeUnsafeByte(1);
+    sink.writeUnsafeByte(heightTwips & 0xff);
+    sink.writeUnsafeByte((heightTwips >> 8) & 0xff);
     sink.writeUnsafeByte(0);
-    sink.writeUnsafeByte(0);
+    sink.writeUnsafeByte(flags);
     sink.writeUnsafeByte(0);
     sink.writeUnsafeByte(1);
     sink.writeUnsafeByte(0);
@@ -280,45 +307,60 @@ export function writeXlsbInlineString(sink: ByteSink, value: string, colNum: num
     sink.writeUtf16LE(value);
 }
 
+export interface XlsbRichString {
+    text: string;
+    /** StrRun entries: character offset and font-table id. */
+    runs: Array<{ ich: number; ifnt: number }>;
+}
+
+export type XlsbSharedString = string | XlsbRichString;
+
+function encodeSstItem(value: XlsbSharedString): Uint8Array {
+    const text = typeof value === 'string' ? value : value.text;
+    const runs = typeof value === 'string' ? [] : value.runs;
+    const encoded = new Uint8Array(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        encoded[i * 2] = code & 0xff;
+        encoded[i * 2 + 1] = (code >> 8) & 0xff;
+    }
+    const payloadLength = 1 + 4 + encoded.length + (runs.length > 0 ? 4 + runs.length * 4 : 0);
+    const payload = new Uint8Array(payloadLength);
+    const view = new DataView(payload.buffer);
+    payload[0] = runs.length > 0 ? 0x01 : 0x00;
+    view.setUint32(1, text.length, true);
+    payload.set(encoded, 5);
+    if (runs.length > 0) {
+        let offset = 5 + encoded.length;
+        view.setUint32(offset, runs.length, true);
+        offset += 4;
+        for (const run of runs) {
+            view.setUint16(offset, run.ich, true);
+            view.setUint16(offset + 2, run.ifnt, true);
+            offset += 4;
+        }
+    }
+    return buildBrtRecord(0x0013, payload);
+}
+
 /**
- * Write the BrtBeginSst / BrtBundleSh-equivalent SST part. Kept byte-compatible
- * with the previous per-writer implementations.
+ * Write `xl/sharedStrings.bin`: BrtBeginSst, one BrtSSTItem per string (plain
+ * or rich) and BrtEndSst.
  */
 export function writeXlsbSharedStrings(
     sink: ByteSink,
-    entries: Iterable<string>,
+    entries: Iterable<XlsbSharedString>,
     countAll: number,
     countUnique: number,
 ): void {
     sink.writeByte(159);
     sink.writeByte(1);
     sink.writeByte(8);
-
     sink.writeInt32LE(countAll);
     sink.writeInt32LE(countUnique);
 
-    for (const text of entries) {
-        const textLength = text.length;
-        sink.writeByte(19);
-
-        const recordLength = 5 + 2 * textLength;
-        if (recordLength >= 128) {
-            sink.writeByte(128 + (recordLength % 128));
-            const high = recordLength >> 7;
-            if (high >= 256) {
-                sink.writeByte(128 + (high % 128));
-            } else {
-                sink.writeByte(high);
-            }
-            sink.writeByte(recordLength >> 14);
-            if ((recordLength >> 14) > 0) sink.writeByte(0);
-        } else {
-            sink.writeByte(recordLength & 0xff);
-            sink.writeByte((recordLength >> 8) & 0xff);
-        }
-
-        sink.writeInt32LE(textLength);
-        sink.writeUtf16LE(text);
+    for (const value of entries) {
+        sink.write(encodeSstItem(value));
     }
 
     sink.writeByte(160);

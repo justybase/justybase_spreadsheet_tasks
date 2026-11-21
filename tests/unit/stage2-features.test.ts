@@ -14,6 +14,7 @@ import { XlsbReader } from '../../src/XlsbReader';
 import { BrowserXlsxWriter } from '../../src/browser/BrowserXlsxWriter';
 import { BrowserXlsbWriter } from '../../src/browser/BrowserXlsbWriter';
 import { CellStyle, CellValue, ExcelError, FormulaCell, RichText, StyledCell } from '../../src/Formats';
+import { passwordHash } from '../../src/writers/core/sheetLayout';
 import {
     AUTOFILTER_BUTTON_WIDTH,
     AUTOFIT_SAMPLE_ROWS,
@@ -49,11 +50,6 @@ const ROWS: CellValue[][] = [
 ];
 const HEADERS = ['A', 'B', 'C'];
 
-/** XLSB does not emit rich strings yet; use the plain text equivalent. */
-const XLSB_ROWS: CellValue[][] = ROWS.map(row =>
-    row.map(cell => (cell instanceof RichText ? cell.toString() : cell)),
-);
-
 const FEATURES = {
     merges: ['A4:B4'],
     hyperlinks: [
@@ -76,6 +72,55 @@ const FEATURES = {
     ],
     comments: [{ ref: 'A1', text: 'note text', author: 'Tester' }],
     columnWidths: [30, 40],
+};
+
+const XLSB_LAYOUT: any = {
+    rowHeights: { 0: 26, 2: 22 },
+    hiddenRows: [1],
+    hiddenColumns: [1],
+    rowGroups: [{ start: 1, end: 2 }],
+    columnGroups: [{ start: 2, end: 3 }],
+    freezePanes: 'B2',
+    showGridLines: false,
+    showRowColHeaders: false,
+    showZeroValues: false,
+    rightToLeft: true,
+    zoom: 125,
+    tabColor: 'FF1F4E78',
+    headerStyle: {
+        font: { bold: true, color: 'FFFFFFFF' },
+        fill: { patternType: 'solid', fgColor: 'FF1F4E78' },
+    },
+    styles: {
+        'B2:C3': { fill: { patternType: 'solid', fgColor: 'FFFFF2CC' } },
+        'C2:C3': { font: { italic: true } },
+    },
+    sheetProtection: {
+        enabled: true,
+        password: 'secret',
+        objects: false,
+        selectLockedCells: true,
+        selectUnlockedCells: false,
+        formatCells: true,
+        insertRows: true,
+    },
+};
+
+const TABLE: any = {
+    name: 'Sales',
+    ref: 'A1:C3',
+    columns: ['A', 'B', 'C'],
+    styleName: 'TableStyleMedium2',
+};
+
+const PARITY_OPTIONS: any = {
+    ...FEATURES,
+    ...XLSB_LAYOUT,
+    tables: [TABLE],
+    comments: [{ ref: 'A5', text: 'note text', author: 'Tester' }],
+    // Tables carry their own autoFilter; a second sheet-level filter on the
+    // same range makes Excel repair the file.
+    doAutofilter: false,
 };
 
 function unpack(buffer: Buffer): Map<string, Buffer> {
@@ -153,16 +198,77 @@ async function testXlsxFeatures(): Promise<void> {
     await inlineReader.close();
 }
 
+async function testXlsxLayoutAndTables(): Promise<void> {
+    const file = path.join(outputDir, 'layout.xlsx');
+    const writer = new XlsxWriter(file, { compressionLevel: 0 });
+    writer.addSheet('Feat');
+    writer.writeSheet(ROWS, HEADERS, PARITY_OPTIONS);
+    await writer.finalize();
+
+    const buffer = fs.readFileSync(file);
+    const parts = unpack(buffer);
+    const sheet = partText(parts, 'xl/worksheets/sheet1.xml');
+    assert.ok(sheet.includes('<sheetPr><tabColor rgb="FF1F4E78"/></sheetPr>'), 'tab colour');
+    assert.ok(sheet.includes('showGridLines="0"'), 'gridlines hidden');
+    assert.ok(sheet.includes('showRowColHeaders="0"'), 'row/column headers hidden');
+    assert.ok(sheet.includes('showZeros="0"'), 'zero values hidden');
+    assert.ok(sheet.includes('rightToLeft="1"'), 'right-to-left view');
+    assert.ok(sheet.includes('zoomScale="125"'), 'zoom written');
+    assert.ok(sheet.includes(
+        '<pane xSplit="1" ySplit="1" topLeftCell="B2" activePane="bottomRight" state="frozen"/>',
+    ), 'freeze pane at B2');
+    assert.ok(sheet.includes('<sheetFormatPr defaultRowHeight="15" outlineLevelCol="1"/>'),
+        'column outline level declared');
+    assert.ok(sheet.includes('<row r="1" ht="26" customHeight="1">'), 'header row height');
+    assert.ok(sheet.includes('<row r="2" hidden="1" outlineLevel="1">'),
+        'hidden row has one hidden attribute and an outline level');
+    assert.ok(sheet.includes('<row r="3" ht="22" customHeight="1" hidden="1" outlineLevel="1">'),
+        'row height and outline combine');
+    assert.ok(/<col min="2" max="2"[^>]* hidden="1"/.test(sheet), 'hidden column');
+    assert.ok(/<col min="3" max="3"[^>]* outlineLevel="1"/.test(sheet), 'column outline level');
+    assert.ok(!sheet.includes('<autoFilter'), 'sheet-level filter is disabled with a table');
+    assert.ok(sheet.includes('<tableParts count="1"><tablePart r:id="'), 'table part linked');
+
+    const protection = buildProtectionFragment(
+        passwordHash('secret').toString(16).toUpperCase(),
+    );
+    assert.ok(sheet.includes(protection), 'sheet protection attributes');
+    assert.ok(!sheet.includes('selectLockedCells="1"'), 'selection stays allowed');
+    assert.ok(!sheet.includes('selectUnlockedCells="0"'), 'unlocked selection is blocked');
+
+    const table = partText(parts, 'xl/tables/table1.xml');
+    assert.ok(table.includes('name="Sales" displayName="Sales" ref="A1:C3"'), 'table identity');
+    assert.ok(table.includes('<autoFilter ref="A1:C3"/>'), 'table auto filter');
+    assert.ok(table.includes('<tableColumn id="1" name="A"/>'), 'table columns');
+    assert.ok(table.includes('name="TableStyleMedium2" showFirstColumn="0"'), 'table style');
+    assert.ok(partText(parts, '[Content_Types].xml').includes('/xl/tables/table1.xml'),
+        'table content type');
+    assert.ok(partText(parts, 'xl/worksheets/_rels/sheet1.xml.rels')
+        .includes('Target="../tables/table1.xml"'), 'table relationship');
+
+    const reader = new XlsxReader();
+    await reader.openBuffer(buffer);
+    await reader.selectSheet('Feat');
+    assert.ok(reader.readRow() !== null, 'header row read');
+    const headerStyle = reader.getStyle(0);
+    assert.equal(headerStyle?.font?.bold, true, 'header font bold');
+    assert.equal(headerStyle?.fill?.fgColor, 'FF1F4E78', 'header fill');
+    assert.ok(reader.readRow() !== null, 'data row read');
+    assert.equal(reader.getStyle(1)?.fill?.fgColor, 'FFFFF2CC', 'range style applied');
+    await reader.close();
+}
+
+function buildProtectionFragment(hash: string): string {
+    return '<sheetProtection sheet="1" objects="0" scenarios="1"'
+        + ` password="${hash}" selectLockedCells="0" selectUnlockedCells="1"`
+        + ' formatCells="1" insertRows="1"/>';
+}
+
 async function testXlsbFeatures(): Promise<void> {
     const file = path.join(outputDir, 'features.xlsb');
     const writer = new XlsbWriter(file, { compressionLevel: 0 });
     writer.addSheet('Feat');
-    writer.writeSheet(XLSB_ROWS, HEADERS, {
-        merges: FEATURES.merges,
-        hyperlinks: FEATURES.hyperlinks,
-        dataValidations: FEATURES.dataValidations,
-        columnWidths: FEATURES.columnWidths,
-    });
+    writer.writeSheet(ROWS, HEADERS, PARITY_OPTIONS);
     await writer.finalize();
 
     const buffer = fs.readFileSync(file);
@@ -175,6 +281,31 @@ async function testXlsbFeatures(): Promise<void> {
     const rels = partText(parts, 'xl/worksheets/_rels/sheet1.bin.rels');
     assert.ok(rels.includes('https://example.com'), 'external hyperlink relationship');
     assert.ok(rels.includes('TargetMode="External"'), 'external target mode');
+    assert.ok(rels.includes('relationships/comments'), 'comments relationship');
+    assert.ok(rels.includes('relationships/table'), 'table relationship');
+    assert.ok(rels.includes('vmlDrawing'), 'comment VML relationship');
+    assert.ok(parts.has('xl/comments/comment1.bin'), 'XLSB comments part');
+    assert.ok(parts.has('xl/drawings/commentsDrawing1.vml'), 'XLSB comments VML');
+    assert.ok(parts.has('xl/tables/table1.bin'), 'XLSB table part');
+    assert.ok(sheet!.includes(Buffer.from([0xcd, 0x03])), 'conditional-format records written');
+    assert.ok(sheet!.includes(Buffer.from([0x94, 0x05])), 'table list-parts record written');
+    assert.ok(sheet!.includes(Buffer.from([0xa7, 0x04])), 'comment legacy-drawing record written');
+
+    const contentTypes = partText(parts, '[Content_Types].xml');
+    assert.ok(contentTypes.includes('/xl/tables/table1.bin'), 'XLSB table content type');
+    assert.ok(contentTypes.includes('/xl/comments/comment1.bin'), 'XLSB comments content type');
+    assert.ok(contentTypes.includes('vmlDrawing'), 'XLSB VML content type');
+
+    const protectionAt = sheet!.indexOf(Buffer.from([0x97, 0x04, 0x42]));
+    assert.ok(protectionAt >= 0, 'XLSB sheet protection record exists');
+    assert.equal(sheet!.readUInt16LE(protectionAt + 3), passwordHash('secret'),
+        'XLSB protection password hash');
+    const flags: number[] = [];
+    for (let index = 0; index < 16; index++) {
+        flags.push(sheet!.readUInt32LE(protectionAt + 5 + index * 4));
+    }
+    assert.deepEqual(flags, [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        'XLSB protection flags block unspecified actions and honour explicit allows');
 
     const reader = new XlsbReader();
     await reader.openBuffer(buffer);
@@ -190,16 +321,6 @@ async function testXlsbFeatures(): Promise<void> {
     assert.equal(reader.getValue(0), 10);
     assert.equal(reader.getValue(1), 30);
     await reader.close();
-
-    await assert.rejects(
-        (async () => {
-            const w = new XlsbWriter(path.join(outputDir, 'unsupported.xlsb'));
-            w.addSheet('S');
-            w.writeSheet([[1]], ['A'], { comments: FEATURES.comments });
-            await w.finalize();
-        })(),
-        /Cell comments are not supported by XlsbWriter/,
-    );
 }
 
 async function testStreamingFeatures(): Promise<void> {
@@ -227,7 +348,7 @@ async function testStreamingFeatures(): Promise<void> {
         dataValidations: [{ sqref: 'C2:C5', type: 'list', values: ['x', 'y'] }],
         columnWidths: [12, 13, 14],
     });
-    for (const row of XLSB_ROWS) xlsb.writeRow(row);
+    for (const row of ROWS) xlsb.writeRow(row);
     xlsb.endSheet();
     await xlsb.finalize();
 
@@ -284,12 +405,12 @@ async function testXlsxParity(): Promise<void> {
     const nodeFile = path.join(outputDir, 'xlsx-parity-node.xlsx');
     const node = new XlsxWriter(nodeFile, { compressionLevel: 0 });
     node.addSheet('Feat');
-    node.writeSheet(ROWS, HEADERS, FEATURES);
+    node.writeSheet(ROWS, HEADERS, PARITY_OPTIONS);
     await node.finalize();
 
     const browser = new BrowserXlsxWriter();
     browser.addSheet('Feat');
-    browser.writeSheet(ROWS, HEADERS, FEATURES);
+    browser.writeSheet(ROWS, HEADERS, PARITY_OPTIONS);
     const browserBuffer = await blobToBuffer(browser.finalize());
 
     const left = unpack(fs.readFileSync(nodeFile));
@@ -304,22 +425,12 @@ async function testParity(): Promise<void> {
     const nodeFile = path.join(outputDir, 'parity-node.xlsb');
     const node = new XlsbWriter(nodeFile, { compressionLevel: 0 });
     node.addSheet('Feat');
-    node.writeSheet(XLSB_ROWS, HEADERS, {
-        merges: FEATURES.merges,
-        hyperlinks: FEATURES.hyperlinks,
-        dataValidations: FEATURES.dataValidations,
-        columnWidths: FEATURES.columnWidths,
-    });
+    node.writeSheet(ROWS, HEADERS, PARITY_OPTIONS);
     await node.finalize();
 
     const browser = new BrowserXlsbWriter();
     browser.addSheet('Feat');
-    browser.writeSheet(XLSB_ROWS, HEADERS, {
-        merges: FEATURES.merges,
-        hyperlinks: FEATURES.hyperlinks,
-        dataValidations: FEATURES.dataValidations,
-        columnWidths: FEATURES.columnWidths,
-    });
+    browser.writeSheet(ROWS, HEADERS, PARITY_OPTIONS);
     const browserBuffer = await blobToBuffer(browser.finalize());
 
     const left = unpack(fs.readFileSync(nodeFile));
@@ -477,6 +588,7 @@ async function testAutofitWidths(): Promise<void> {
 async function main(): Promise<void> {
     try {
         await testXlsxFeatures();
+        await testXlsxLayoutAndTables();
         await testXlsbFeatures();
         await testStreamingFeatures();
         await testXlsxParity();

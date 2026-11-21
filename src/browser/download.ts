@@ -15,7 +15,38 @@ export type {
 } from './BrowserXlsbWriter';
 export { BrowserBigBuffer } from './BrowserBigBuffer';
 export { BrowserZip } from './BrowserZip';
-export { F, type CellValue, type FormattedCell, type CellStyle, type StyledCell, type FormulaCell, type RichText, type RichTextRun } from '../Formats';
+export {
+    F,
+    RichText,
+    mergeCellStyles,
+    type CellValue,
+    type FormattedCell,
+    type CellStyle,
+    type StyledCell,
+    type FormulaCell,
+    type RichTextRun,
+    type GradientFillStyle,
+    type GradientStop,
+    type BorderStyle,
+    type BorderSide,
+    type AlignmentStyle,
+    type ProtectionStyle,
+} from '../Formats';
+export type {
+    HyperlinkSpec,
+    DataValidationSpec,
+    ConditionalFormatSpec,
+    ConditionalFormatRule,
+    CommentSpec,
+    SheetLayoutOptions,
+} from '../writers/core/xlsxParts';
+export type {
+    GroupSpec,
+    TableSpec,
+    TableColumnSpec,
+    SheetProtectionSpec,
+    FreezePane,
+} from '../writers/core/sheetLayout';
 
 /** Trigger browser download of a Blob */
 function triggerDownload(blob: Blob, fileName: string): void {

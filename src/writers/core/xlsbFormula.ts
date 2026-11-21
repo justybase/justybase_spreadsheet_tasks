@@ -62,6 +62,7 @@ const FUNCTIONS: Record<string, FunctionInfo> = {
     TEXT: { id: 48, min: 2, max: 2, fixed: 2, classes: 'VV' },
     MATCH: { id: 64, min: 2, max: 3, fixed: null, classes: 'VRR' },
     DATE: { id: 65, min: 3, max: 3, fixed: 3, classes: 'VVV' },
+    TIME: { id: 66, min: 3, max: 3, fixed: 3, classes: 'VVV' },
     DAY: { id: 67, min: 1, max: 1, fixed: 1, classes: 'V' },
     MONTH: { id: 68, min: 1, max: 1, fixed: 1, classes: 'V' },
     YEAR: { id: 69, min: 1, max: 1, fixed: 1, classes: 'V' },
@@ -97,6 +98,7 @@ const FUNCTIONS: Record<string, FunctionInfo> = {
     SUMPRODUCT: { id: 228, min: 1, max: 255, fixed: null, classes: 'A' },
     FLOOR: { id: 285, min: 2, max: 2, fixed: 2, classes: 'VV' },
     CEILING: { id: 288, min: 2, max: 2, fixed: 2, classes: 'VV' },
+    SUBTOTAL: { id: 344, min: 2, max: 255, fixed: null, classes: 'VR' },
     CONCATENATE: { id: 336, min: 0, max: 255, fixed: null, classes: 'V' },
     POWER: { id: 337, min: 2, max: 2, fixed: 2, classes: 'VV' },
     SUMIF: { id: 345, min: 2, max: 3, fixed: null, classes: 'RVR' },
@@ -320,12 +322,35 @@ function columnField(part: ReferencePart): number {
         | (part.rowRelative ? 0x8000 : 0);
 }
 
-function emitReference(text: string, operand: OperandClass): number[] {
+interface FormulaContext {
+    originCol: number;
+    originRow: number;
+    /** CF/DVal formulas store relative references as offsets (PtgRefN/AreaN). */
+    relativeOffsets: boolean;
+}
+
+const DEFAULT_CONTEXT: FormulaContext = { originCol: 0, originRow: 0, relativeOffsets: false };
+
+function applyOrigin(part: ReferencePart, context: FormulaContext): ReferencePart {
+    if (!context.relativeOffsets) return part;
+    return {
+        ...part,
+        row: part.rowRelative ? (part.row - context.originRow) & 0xfffff : part.row,
+        col: part.colRelative ? (part.col - context.originCol) & 0x3fff : part.col,
+    };
+}
+
+function emitReference(
+    text: string,
+    operand: OperandClass,
+    context: FormulaContext = DEFAULT_CONTEXT,
+): number[] {
     const parts = text.split(':');
     const base = operand === 'R' ? 0x20 : operand === 'A' ? 0x60 : 0x40;
     if (parts.length === 1) {
-        const part = parseReferencePart(parts[0], 'cell');
-        return [base | 0x04, ...u32(part.row), ...u16(columnField(part))];
+        const part = applyOrigin(parseReferencePart(parts[0], 'cell'), context);
+        const relative = context.relativeOffsets && (part.colRelative || part.rowRelative);
+        return [base | (relative ? 0x0c : 0x04), ...u32(part.row), ...u16(columnField(part))];
     }
     if (parts.length !== 2) throw new Error(`Invalid XLSB range '${text}'`);
     const kind = refKind(parts[0]);
@@ -341,8 +366,12 @@ function emitReference(text: string, operand: OperandClass): number[] {
         first = { ...first, col: 0, colRelative: false };
         last = { ...last, col: 16383, colRelative: false };
     }
+    const relative = context.relativeOffsets && (first.colRelative || first.rowRelative
+        || last.colRelative || last.rowRelative);
+    first = applyOrigin(first, context);
+    last = applyOrigin(last, context);
     return [
-        base | 0x05,
+        base | (relative ? 0x0d : 0x05),
         ...u32(first.row), ...u32(last.row),
         ...u16(columnField(first)), ...u16(columnField(last)),
     ];
@@ -386,7 +415,11 @@ function functionArgumentClass(info: FunctionInfo, index: number): OperandClass 
     return chars[Math.min(index, chars.length - 1)] === 'R' ? 'R' : 'V';
 }
 
-function emitNode(node: Node, operand: OperandClass = 'V'): number[] {
+function emitNode(
+    node: Node,
+    operand: OperandClass = 'V',
+    context: FormulaContext = DEFAULT_CONTEXT,
+): number[] {
     switch (node.kind) {
         case 'number': {
             if (Number.isInteger(node.value) && node.value >= 0 && node.value <= 65535) {
@@ -403,20 +436,20 @@ function emitNode(node: Node, operand: OperandClass = 'V'): number[] {
         case 'missing':
             return [0x16];
         case 'reference':
-            return emitReference(node.value, operand);
+            return emitReference(node.value, operand, context);
         case 'paren':
-            return [...emitNode(node.value, operand), 0x15];
+            return [...emitNode(node.value, operand, context), 0x15];
         case 'percent':
-            return [...emitNode(node.value), 0x14];
+            return [...emitNode(node.value, 'V', context), 0x14];
         case 'unary':
-            return [...emitNode(node.value), node.op === '+' ? 0x12 : 0x13];
+            return [...emitNode(node.value, 'V', context), node.op === '+' ? 0x12 : 0x13];
         case 'binary': {
             const argType: OperandClass = node.op === ',' || node.op === ' ' || node.op === ':'
                 ? 'R'
                 : 'V';
             return [
-                ...emitNode(node.left, argType),
-                ...emitNode(node.right, argType),
+                ...emitNode(node.left, argType, context),
+                ...emitNode(node.right, argType, context),
                 OPERATOR_IDS[node.op],
             ];
         }
@@ -430,7 +463,8 @@ function emitNode(node: Node, operand: OperandClass = 'V'): number[] {
                     `${node.name} expects ${info.min}..${info.max} arguments, got ${node.args.length}`,
                 );
             }
-            const encoded = node.args.map((arg, index) => emitNode(arg, functionArgumentClass(info, index)));
+            const encoded = node.args.map((arg, index) =>
+                emitNode(arg, functionArgumentClass(info, index), context));
             const resultClass = operand === 'R' ? 0x20 : operand === 'A' ? 0x60 : 0x40;
             const ending = info.fixed !== null
                 ? [resultClass | 0x01, ...u16(info.id)]
@@ -477,20 +511,58 @@ function containsVolatile(node: Node): boolean {
     }
 }
 
-/** Compile formula text (with or without a leading `=`) to BIFF12 tokens. */
-export function compileXlsbFormula(formula: string): Uint8Array {
+export interface XlsbCompiledFormula {
+    tokens: Uint8Array;
+    /** Number of cell references, needed for conditional-format record sizes. */
+    references: number;
+}
+
+export interface XlsbFormulaOptions {
+    /** Zero-based top-left cell the formula is relative to (CF/DVal ranges). */
+    origin?: { col: number; row: number };
+    /**
+     * Store relative references as offsets from `origin` with PtgRefN/PtgAreaN.
+     * Conditional-format and data-validation formulas need this; cell formulas
+     * keep absolute coordinates in PtgRef/PtgArea.
+     */
+    relativeOffsets?: boolean;
+}
+
+/** Compile formula text and report how many references it contains. */
+export function compileXlsbFormulaStats(
+    formula: string,
+    options: XlsbFormulaOptions = {},
+): XlsbCompiledFormula {
     const text = formula.trim().replace(/^=/, '');
     if (!text) throw new Error('FormulaCell.formula must not be empty');
     if (text.length > 8192) throw new RangeError('XLSB formula text is limited to 8192 characters');
-    const tree = new Parser(tokenize(text)).parse();
-    let tokens = emitNode(tree);
+    const rawTokens = tokenize(text);
+    let references = 0;
+    for (let index = 0; index < rawTokens.length; index++) {
+        if (ADDRESS_RE.test(rawTokens[index]) && rawTokens[index + 1] !== '(') references++;
+    }
+    const tree = new Parser(rawTokens).parse();
+    const context: FormulaContext = {
+        originCol: options.origin?.col ?? 0,
+        originRow: options.origin?.row ?? 0,
+        relativeOffsets: options.relativeOffsets === true,
+    };
+    let tokens = emitNode(tree, 'V', context);
     if (containsVolatile(tree)) {
         tokens = [0x19, 0x01, 0x00, 0x00, ...tokens];
     }
     if (tokens.length === 0 || tokens.length > 16384) {
         throw new RangeError('XLSB formula token length exceeds the BIFF12 limit');
     }
-    return Uint8Array.from(tokens);
+    return { tokens: Uint8Array.from(tokens), references };
+}
+
+/** Compile formula text (with or without a leading `=`) to BIFF12 tokens. */
+export function compileXlsbFormula(
+    formula: string,
+    options: XlsbFormulaOptions = {},
+): Uint8Array {
+    return compileXlsbFormulaStats(formula, options).tokens;
 }
 
 function wideString(text: string): number[] {

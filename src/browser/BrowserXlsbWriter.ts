@@ -7,12 +7,15 @@
 import { BrowserBigBuffer } from './BrowserBigBuffer';
 import { BrowserZip } from './BrowserZip';
 import {
+    CellStyle,
     CellValue,
     ExcelError,
     FormulaCell,
+    StyleColor,
     getCellStyle,
     getFormula,
     isRichText,
+    mergeCellStyles,
     unwrapCell,
 } from '../Formats';
 import {
@@ -39,10 +42,19 @@ import {
     writeXlsbRkInteger,
     writeXlsbRowHeader,
     writeXlsbSharedStrings,
+    XlsbSharedString,
     XLSB_STYLES_TEMPLATE,
 } from '../writers/core/xlsbRecords';
 import { XlsbStyleRegistry } from '../writers/core/xlsbStyles';
 import { buildXlsbFormulaRecord } from '../writers/core/xlsbFormula';
+import {
+    applyXlsbSheetProtection,
+    buildXlsbColumnRecords,
+    buildXlsbLegacyDrawingRecord,
+    buildXlsbPaneRecord,
+    buildXlsbSelectionRecord,
+    xlsbColorPayload,
+} from '../writers/core/xlsbLayout';
 import {
     buildXlsbHyperlinkRecord,
     buildXlsbMergeRecords,
@@ -50,19 +62,76 @@ import {
     parseXlsbRange,
 } from '../writers/core/xlsbSheetFeatures';
 import {
+    CommentSpec,
+    ConditionalFormatSpec,
     DataValidationSpec,
     HyperlinkSpec,
+    SheetLayoutOptions,
     XlsxSheetFeatures,
 } from '../writers/core/xlsxParts';
+import {
+    FreezePane,
+    NormalizedTableSpec,
+    Outline,
+    SheetProtectionSpec,
+    StyleRangeSet,
+    buildOutline,
+    normalizeGroups,
+    normalizeTableSpec,
+    parseRangeRef,
+    resolveFreezePanes,
+    tableTotalsOverrides,
+    TableTotalsOverride,
+    validateRowHeight,
+    validateZoom,
+} from '../writers/core/sheetLayout';
+import {
+    XlsbDxfRegistry,
+    buildXlsbConditionalFormatRecords,
+} from '../writers/core/xlsbConditionalFormat';
+import { buildXlsbCommentsPart, buildXlsbCommentsVml } from '../writers/core/xlsbComments';
+import { buildXlsbListParts, buildXlsbTablePart } from '../writers/core/xlsbTable';
 import { escapeXmlText } from '../xmlUtils';
+import { XLSX_THEME_XML } from '../writers/core/theme';
 
 const INVALID_SHEET_NAME_CHARS = /[\\/*?[\]:]/g;
 
+/** Apply table totals overrides to one row, preserving the caller's style/cache. */
+function withTableTotals(row: CellValue[], overrides: TableTotalsOverride[]): CellValue[] {
+    let result: CellValue[] | null = null;
+    for (const override of overrides) {
+        if (override.col < 0) continue;
+        const original = row[override.col];
+        const record = original !== null && typeof original === 'object' && !(original instanceof Date)
+            ? original as unknown as Record<string, unknown>
+            : null;
+        const style = record && record.style ? record.style as CellStyle : undefined;
+        const cachedValue = record?.value;
+        const cached = typeof cachedValue === 'string' || typeof cachedValue === 'number'
+            || typeof cachedValue === 'boolean' || cachedValue instanceof Date
+            ? cachedValue
+            : (typeof original === 'number' ? original : undefined);
+        const replacement: CellValue = override.text !== undefined
+            ? (style ? { value: override.text, style } : override.text)
+            : {
+                formula: override.formula as string,
+                ...(cached !== undefined ? { value: cached } : {}),
+                ...(style ? { style } : {}),
+            } as CellValue;
+        if (!result) result = row.slice();
+        result[override.col] = replacement;
+    }
+    return result ?? row;
+}
+
 type BrowserHeaderStyle = 'bold' | 'fill' | 'bold+fill';
 
-export interface BrowserSheetOptions extends XlsxSheetFeatures {
+export interface BrowserSheetOptions extends XlsxSheetFeatures, Omit<SheetLayoutOptions, 'headerStyle'> {
     doAutofilter?: boolean;
-    headerStyle?: BrowserHeaderStyle;
+    /** Preset header style; a `headerStyle` CellStyle overrides it. */
+    headerPreset?: BrowserHeaderStyle;
+    /** Preset name (`bold`, `fill`, `bold+fill`) or an arbitrary cell style. */
+    headerStyle?: BrowserHeaderStyle | CellStyle;
     /** Conservative autofit from headers and the first rows (default true). */
     autofit?: boolean;
     /** Rows measured by autofit (default 200); 0 measures only headers/samples. */
@@ -83,6 +152,26 @@ interface BrowserFilterData {
     endColumn: number;
 }
 
+interface ResolvedBrowserLayout {
+    headerStyle: CellStyle | null;
+    styleRanges: StyleRangeSet;
+    rowHeights: Record<number, number>;
+    hiddenRows: Set<number>;
+    hiddenColumns: number[];
+    rowOutline: Outline;
+    columnOutline: Outline;
+    freezePanes: FreezePane | null;
+    showGridLines: boolean;
+    showRowColHeaders: boolean;
+    showZeroValues: boolean;
+    rightToLeft: boolean;
+    zoom?: number;
+    tabColor?: StyleColor;
+    sheetProtection?: SheetProtectionSpec;
+    autoFilterRef?: string;
+    tables: NormalizedTableSpec[];
+}
+
 interface BrowserSheetEntry {
     name: string;
     pathInArchive: string;
@@ -93,7 +182,15 @@ interface BrowserSheetEntry {
     filterData?: BrowserFilterData;
     merges?: string[];
     dataValidations?: DataValidationSpec[];
+    conditionalFormats?: ConditionalFormatSpec[];
+    cfRecords?: Uint8Array;
+    comments?: CommentSpec[];
+    commentRId?: string;
+    commentVmlRId?: string;
     hyperlinks?: Array<{ spec: HyperlinkSpec; rId?: string; row: number; col: number }>;
+    layout?: ResolvedBrowserLayout;
+    tableParts?: Array<{ id: number; path: string; data: Uint8Array; rId: string }>;
+    extraParts?: Array<{ name: string; data: Uint8Array }>;
 }
 
 export class BrowserXlsbWriter {
@@ -101,8 +198,12 @@ export class BrowserXlsbWriter {
     private _sheetCount: number;
     private _sheetList: BrowserSheetEntry[];
     private _sstDic: Map<string, number>;
+    private _sstRichDic: Map<string, number>;
+    private _sstValues: XlsbSharedString[];
     private _sstCntUnique: number;
     private _sstCntAll: number;
+    private _nextTableId: number;
+    private readonly _dxfs: XlsbDxfRegistry;
     private _colWidths: number[];
     private _autofilterIsOn: boolean;
     private _oaEpoch: number;
@@ -117,6 +218,7 @@ export class BrowserXlsbWriter {
     private _streamHasHeaders: boolean;
     private _streamDataRows: number;
     private _streamAutofitRows: number;
+    private _streamTableTotals: Map<number, TableTotalsOverride[]> = new Map();
     private readonly _styles: XlsbStyleRegistry;
     private _sheet1Bytes: Uint8Array<ArrayBuffer>;
     private _workbookBinStart: Uint8Array<ArrayBuffer>;
@@ -140,8 +242,11 @@ export class BrowserXlsbWriter {
         this._sheetCount = 0;
         this._sheetList = [];
         this._sstDic = new Map();
+        this._sstRichDic = new Map();
+        this._sstValues = [];
         this._sstCntUnique = 0;
         this._sstCntAll = 0;
+        this._nextTableId = 1;
         this._colWidths = [];
         this._autofilterIsOn = false;
         this._oaEpoch = Date.UTC(1899, 11, 30);
@@ -159,6 +264,7 @@ export class BrowserXlsbWriter {
         this._streamAutofitRows = AUTOFIT_SAMPLE_ROWS;
 
         this._styles = new XlsbStyleRegistry();
+        this._dxfs = new XlsbDxfRegistry(format => this._styles.registerNumberFormat(format));
 
         this._sheet1Bytes = new Uint8Array([
             0x81, 0x01, 0x00, 0x93, 0x01, 0x17, 0xCB, 0x04,
@@ -271,7 +377,9 @@ export class BrowserXlsbWriter {
     }
 
     _buildStylesBin(): Uint8Array<ArrayBuffer> {
-        return new Uint8Array(this._styles.toStylesBin(this._stylesBin));
+        return new Uint8Array(
+            this._styles.toStylesBin(this._stylesBin, this._dxfs.toRecords()),
+        );
     }
 
     /** Resolve column widths; explicit widths win over the conservative autofit. */
@@ -281,6 +389,7 @@ export class BrowserXlsbWriter {
         rows: unknown[][] | undefined,
         options: BrowserSheetOptions & { sampleRows?: unknown[][] },
         doAutofilter: boolean,
+        headerStyle?: CellStyle,
     ): number[] {
         const widths = initColWidths(columnCount);
         if (options.columnWidths) {
@@ -293,7 +402,7 @@ export class BrowserXlsbWriter {
         if (options.autofit === false) return widths;
         if (headers) {
             applyHeaderWidths(widths, headers, columnCount, {
-                bold: options.headerStyle !== 'fill',
+                bold: headerStyle ? headerStyle.font?.bold === true : true,
                 filterButton: doAutofilter,
             });
         }
@@ -305,18 +414,136 @@ export class BrowserXlsbWriter {
         return widths;
     }
 
-    /** Store supported sheet features; reject ones XLSB does not emit yet. */
+    private _presetHeaderStyle(options: BrowserSheetOptions): CellStyle | null {
+        if (options.headerStyle && typeof options.headerStyle !== 'string') {
+            // Match XlsbWriter: the explicit style is layered over bold.
+            return mergeCellStyles({ font: { bold: true } }, options.headerStyle);
+        }
+        const preset = options.headerPreset
+            ?? (typeof options.headerStyle === 'string' ? options.headerStyle : undefined)
+            ?? 'bold';
+        if (preset === 'bold') return null;
+        const base: CellStyle = {};
+        if (preset === 'bold+fill') base.font = { bold: true };
+        if (preset === 'fill' || preset === 'bold+fill') {
+            base.fill = { patternType: 'solid', fgColor: 'FFD9E1F2' };
+        }
+        return base;
+    }
+
+    private _headerStyleIndex(layout: ResolvedBrowserLayout): number {
+        return layout.headerStyle ? this._styles.register(layout.headerStyle) : 3;
+    }
+
+    private _resolveLayout(
+        options: BrowserSheetOptions,
+        hasHeaders: boolean,
+        columnCount: number,
+        headers: string[] | null | undefined,
+        rowCount: number = 0,
+    ): ResolvedBrowserLayout {
+        const rowHeights: Record<number, number> = {};
+        for (const [key, value] of Object.entries(options.rowHeights ?? {})) {
+            const row = Number(key);
+            if (!Number.isInteger(row) || row < 0) {
+                throw new RangeError(`rowHeights keys must be non-negative row indices, got '${key}'`);
+            }
+            rowHeights[row] = validateRowHeight(value);
+        }
+        const hiddenRows = new Set<number>();
+        for (const row of options.hiddenRows ?? []) {
+            if (!Number.isInteger(row) || row < 0) {
+                throw new RangeError(`hiddenRows must contain non-negative row indices, got ${row}`);
+            }
+            hiddenRows.add(row);
+        }
+        const hiddenColumns: number[] = [];
+        for (const col of options.hiddenColumns ?? []) {
+            if (!Number.isInteger(col) || col < 0 || col >= columnCount) {
+                throw new RangeError(`hiddenColumns index ${col} is outside the sheet`);
+            }
+            hiddenColumns.push(col);
+        }
+        const rowGroups = normalizeGroups(options.rowGroups, 'row');
+        const columnGroups = normalizeGroups(options.columnGroups, 'column');
+        const rowMax = Math.max(
+            rowCount - 1,
+            ...rowGroups.map(group => group.end),
+            ...Object.keys(rowHeights).map(Number),
+            ...hiddenRows,
+            0,
+        );
+        const columnMax = Math.max(
+            columnCount - 1,
+            ...columnGroups.map(group => group.end),
+            ...hiddenColumns,
+            0,
+        );
+        const tables: NormalizedTableSpec[] = [];
+        for (const spec of options.tables ?? []) {
+            let columns = spec.columns;
+            if ((!columns || columns.length === 0) && headers) {
+                const range = parseRangeRef(spec.ref);
+                columns = headers.slice(range.c1, range.c2 + 1);
+            }
+            tables.push(normalizeTableSpec({ ...spec, columns }, this._nextTableId++));
+        }
+        if (options.autoFilterRef !== undefined) parseRangeRef(options.autoFilterRef);
+        return {
+            headerStyle: this._presetHeaderStyle(options),
+            styleRanges: new StyleRangeSet(options.styles),
+            rowHeights,
+            hiddenRows,
+            hiddenColumns,
+            rowOutline: buildOutline(rowGroups, rowMax),
+            columnOutline: buildOutline(columnGroups, columnMax),
+            freezePanes: resolveFreezePanes(options.freezePanes, hasHeaders),
+            showGridLines: options.showGridLines !== false,
+            showRowColHeaders: options.showRowColHeaders !== false,
+            showZeroValues: options.showZeroValues !== false,
+            rightToLeft: options.rightToLeft === true,
+            zoom: validateZoom(options.zoom),
+            tabColor: options.tabColor,
+            sheetProtection: options.sheetProtection,
+            autoFilterRef: options.autoFilterRef,
+            tables,
+        };
+    }
+
+    private _rowHeaderOptions(
+        layout: ResolvedBrowserLayout | undefined,
+        rowIndex: number,
+    ): import('../writers/core/xlsbRecords').XlsbRowHeaderOptions {
+        if (!layout) return {};
+        const options: import('../writers/core/xlsbRecords').XlsbRowHeaderOptions = {};
+        const height = layout.rowHeights[rowIndex];
+        if (height !== undefined) options.heightTwips = Math.round(height * 20);
+        if (layout.hiddenRows.has(rowIndex)) options.hidden = true;
+        if (rowIndex < layout.rowOutline.level.length) {
+            options.outlineLevel = layout.rowOutline.level[rowIndex];
+            if (layout.rowOutline.hidden[rowIndex]) options.hidden = true;
+            if (layout.rowOutline.collapsed[rowIndex]) options.collapsed = true;
+        }
+        return options;
+    }
+
+    /** Store sheet features and build the worksheet extra parts. */
     private _applySheetFeatures(sheet: BrowserSheetEntry, features: BrowserSheetOptions): void {
-        if (features.conditionalFormats && features.conditionalFormats.length > 0) {
-            throw new Error('Conditional formatting is not supported by BrowserXlsbWriter yet; use BrowserXlsxWriter.');
-        }
-        if (features.comments && features.comments.length > 0) {
-            throw new Error('Cell comments are not supported by BrowserXlsbWriter yet; use BrowserXlsxWriter.');
-        }
         if (features.merges) sheet.merges = features.merges;
         if (features.dataValidations) sheet.dataValidations = features.dataValidations;
+
+        if (features.conditionalFormats && features.conditionalFormats.length > 0) {
+            sheet.conditionalFormats = features.conditionalFormats;
+            // Priorities are scoped to one sheet, so every sheet starts at 1.
+            sheet.cfRecords = buildXlsbConditionalFormatRecords(
+                features.conditionalFormats,
+                this._dxfs,
+                1,
+            );
+        }
+
+        let nextRelId = 2;
         if (features.hyperlinks && features.hyperlinks.length > 0) {
-            let nextRelId = 2;
             sheet.hyperlinks = features.hyperlinks.map(spec => {
                 const range = parseXlsbRange(spec.ref);
                 const internal = spec.target === undefined;
@@ -327,6 +554,35 @@ export class BrowserXlsbWriter {
                     col: range.c1,
                 };
             });
+        }
+
+        const layout = sheet.layout;
+        if (layout && layout.tables.length > 0) {
+            sheet.tableParts = [];
+            for (let index = 0; index < layout.tables.length; index++) {
+                const table = layout.tables[index];
+                const id = this._nextTableId - layout.tables.length + index;
+                const path = `xl/tables/table${id}.bin`;
+                const data = buildXlsbTablePart(table, id);
+                sheet.tableParts.push({ id, path, data, rId: `rId${nextRelId++}` });
+                sheet.extraParts = [...(sheet.extraParts ?? []), { name: path, data }];
+            }
+        }
+
+        if (features.comments && features.comments.length > 0) {
+            sheet.comments = features.comments;
+            sheet.commentRId = `rId${nextRelId++}`;
+            sheet.commentVmlRId = `rId${nextRelId++}`;
+            const commentPath = `xl/comments/comment${sheet.sheetId}.bin`;
+            const vmlPath = `xl/drawings/commentsDrawing${sheet.sheetId}.vml`;
+            sheet.extraParts = [
+                ...(sheet.extraParts ?? []),
+                { name: commentPath, data: buildXlsbCommentsPart(features.comments, commentPath) },
+                {
+                    name: vmlPath,
+                    data: new TextEncoder().encode(buildXlsbCommentsVml(features.comments)),
+                },
+            ];
         }
     }
 
@@ -340,6 +596,23 @@ export class BrowserXlsbWriter {
         for (const link of sheet.hyperlinks ?? []) {
             bb.write(buildXlsbHyperlinkRecord(link.row, link.col, link.spec, link.rId));
         }
+        if (sheet.cfRecords && sheet.cfRecords.length > 0) {
+            bb.write(sheet.cfRecords);
+        }
+    }
+
+    private _writeSheetFooterRecords(
+        bb: BrowserBigBuffer,
+        sheet: BrowserSheetEntry,
+        sheetHeader: Uint8Array,
+    ): void {
+        bb.write(sheetHeader.subarray(290, 346));
+        const relIds = (sheet.tableParts ?? []).map(part => part.rId);
+        if (relIds.length > 0) bb.write(buildXlsbListParts(relIds));
+        if (sheet.commentVmlRId !== undefined) {
+            bb.write(buildXlsbLegacyDrawingRecord(sheet.commentVmlRId));
+        }
+        bb.write(sheetHeader.subarray(346));
     }
 
     addSheet(sheetName: string, hidden = false): void {
@@ -362,10 +635,17 @@ export class BrowserXlsbWriter {
             assertRowFitsColumns('header', headers.length, columnCount);
             for (const h of headers) assertCellTextLength(h);
         }
-        const { hidden = false, doAutofilter = true, headerStyle = 'bold' } = options;
-        let hs = 3; if (headerStyle === 'fill') hs = 4; else if (headerStyle === 'bold+fill') hs = 5;
+        const { hidden = false, doAutofilter = true } = options;
         this.addSheet(sheetName, hidden);
         const sheet = this._sheetList[this._sheetCount - 1];
+        const layout = this._resolveLayout(options, headers !== undefined, columnCount, headers);
+        sheet.layout = layout;
+        this._streamTableTotals = new Map();
+        for (const override of tableTotalsOverrides(layout.tables)) {
+            const list = this._streamTableTotals.get(override.row) ?? [];
+            list.push(override);
+            this._streamTableTotals.set(override.row, list);
+        }
         this._applySheetFeatures(sheet, options);
         this._isStreaming = true;
         this._currentSheetBuffer = new BrowserBigBuffer();
@@ -379,6 +659,7 @@ export class BrowserXlsbWriter {
             undefined,
             options,
             doAutofilter && headers !== undefined,
+            layout.headerStyle ?? undefined,
         );
 
         // Delay the head until the first AUTOFIT_SAMPLE_ROWS rows are measured.
@@ -390,8 +671,19 @@ export class BrowserXlsbWriter {
 
         if (headers) {
             const pending = this._streamPending;
-            this.createRowHeader(pending, this._currentSheetRowNum, this._currentSheetStartCol, this._currentSheetEndCol);
-            for (let c = 0; c < headers.length; c++) this.writeString(pending, headers[c], c, hs);
+            this.createRowHeader(
+                pending, this._currentSheetRowNum, this._currentSheetStartCol, this._currentSheetEndCol,
+                this._rowHeaderOptions(layout, 0),
+            );
+            const headerStyle = this._headerStyleIndex(layout);
+            const baseHeader = layout.headerStyle ?? { font: { bold: true } };
+            for (let c = 0; c < headers.length; c++) {
+                const rangeStyle = layout.styleRanges.styleFor(0, c);
+                const style = rangeStyle
+                    ? this._styles.register(mergeCellStyles(baseHeader, rangeStyle))
+                    : headerStyle;
+                this.writeString(pending, headers[c], c, 0, style);
+            }
             this._currentSheetRowNum++;
         }
         if (this._streamAutofitRows === 0) this._flushStreamHead();
@@ -412,8 +704,22 @@ export class BrowserXlsbWriter {
 
     private _writeStreamRow(bb: BrowserBigBuffer, row: CellValue[]): void {
         assertRowCount(this._currentSheetRowNum + 1);
-        this.createRowHeader(bb, this._currentSheetRowNum, this._currentSheetStartCol, this._currentSheetEndCol);
-        for (let c = 0; c < row.length; c++) this._writeCell(bb, row[c], c);
+        const layout = this._sheetList[this._sheetCount - 1]?.layout;
+        const totals = this._streamTableTotals.get(this._currentSheetRowNum);
+        if (totals) row = withTableTotals(row, totals);
+        this.createRowHeader(
+            bb,
+            this._currentSheetRowNum,
+            this._currentSheetStartCol,
+            this._currentSheetEndCol,
+            this._rowHeaderOptions(layout, this._currentSheetRowNum),
+        );
+        for (let c = 0; c < row.length; c++) {
+            this._writeCell(
+                bb, row[c], c,
+                layout?.styleRanges.styleFor(this._currentSheetRowNum, c),
+            );
+        }
         this._currentSheetRowNum++;
     }
 
@@ -437,8 +743,11 @@ export class BrowserXlsbWriter {
         this._flushStreamHead();
         const bb = this._currentSheetBuffer;
         if (!this._isStreaming || bb === null) throw new Error('Not streaming');
-        bb.write(this._sheet1Bytes.subarray(218, 290));
-        
+        const sheet = this._sheetList[this._sheetCount - 1];
+        const sheetHeader = new Uint8Array(this._sheet1Bytes);
+        applyXlsbSheetProtection(sheetHeader, sheet.layout?.sheetProtection);
+        bb.write(sheetHeader.subarray(218, 290));
+
         if (this._currentSheetDoAutofilter) {
             this._autofilterIsOn = true;
             bb.write(this._autoFilterStartBytes);
@@ -453,18 +762,18 @@ export class BrowserXlsbWriter {
             cView.setInt32(4, this._currentSheetEndCol - 1, true);
             bb.write(cBuf);
             bb.write(this._autoFilterEndBytes);
-            
-            this._sheetList[this._sheetCount - 1].filterData = {
+
+            sheet.filterData = {
                 startRow: 0, endRow: this._currentSheetRowNum - 1,
                 startColumn: this._currentSheetStartCol, endColumn: this._currentSheetEndCol - 1
             };
         }
 
-        this._writeFeatureRecords(bb, this._sheetList[this._sheetCount - 1]);
+        this._writeFeatureRecords(bb, sheet);
+        this._writeSheetFooterRecords(bb, sheet, sheetHeader);
 
-        bb.write(this._sheet1Bytes.subarray(290));
         bb.patchInt32LE(36, Math.max(0, this._currentSheetRowNum - 1));
-        this._zip.addFile(this._sheetList[this._sheetCount - 1].pathInArchive, bb.toUint8Array());
+        this._zip.addFile(sheet.pathInArchive, bb.toUint8Array());
         this._isStreaming = false;
         this._currentSheetBuffer = null;
         this._streamPending = null;
@@ -472,12 +781,11 @@ export class BrowserXlsbWriter {
         this._streamHasHeaders = false;
         this._streamDataRows = 0;
         this._streamAutofitRows = AUTOFIT_SAMPLE_ROWS;
+        this._streamTableTotals = new Map();
     }
 
     writeSheet(rows: CellValue[][], headers: string[] | null = null, options: BrowserSheetOptions = {}): void {
         const doAutofilter = options.doAutofilter !== false;
-        const headerStyle = options.headerStyle || 'bold';
-        let hs = 3; if (headerStyle === 'fill') hs = 4; else if (headerStyle === 'bold+fill') hs = 5;
         const bb = new BrowserBigBuffer();
         const colCount = rows.length > 0 ? rows[0].length : (headers ? headers.length : 0);
         if (colCount > 0) assertColumnCount(colCount);
@@ -490,33 +798,73 @@ export class BrowserXlsbWriter {
         for (let r = 0; r < rows.length; r++) assertRowFitsColumns('row', rows[r].length, colCount);
         const sheet = this._sheetList[this._sheetCount - 1];
         if (!sheet) throw new Error('Call addSheet() before writeSheet()');
+
+        const layout = this._resolveLayout(
+            options, headers !== null, colCount, headers, totalBr,
+        );
+        sheet.layout = layout;
         this._applySheetFeatures(sheet, options);
+
+        const totalsOverrides = tableTotalsOverrides(layout.tables);
+        if (totalsOverrides.length > 0) {
+            const headerOffset = headers ? 1 : 0;
+            const byRow = new Map<number, TableTotalsOverride[]>();
+            for (const override of totalsOverrides) {
+                const index = override.row - headerOffset;
+                if (index < 0 || index >= rows.length) {
+                    throw new Error(
+                        `Table totals row ${override.row + 1} is outside the written rows `
+                        + `(the sheet has ${totalBr} rows)`,
+                    );
+                }
+                const list = byRow.get(index) ?? [];
+                list.push(override);
+                byRow.set(index, list);
+            }
+            for (const [index, list] of byRow) {
+                rows[index] = withTableTotals(rows[index], list);
+            }
+        }
+
         this._colWidths = this._resolveColumnWidths(
             colCount,
             headers,
             rows,
             options,
             doAutofilter && headers !== null,
+            layout.headerStyle ?? undefined,
         );
-        
+
         const doAf = doAutofilter && !!headers;
         this._writeSheetHeader(bb, 0, colCount, doAf);
-        
+
         let rn = 0;
         if (headers) {
-            this.createRowHeader(bb, rn, 0, colCount);
-            for (let c = 0; c < headers.length; c++) this.writeString(bb, headers[c], c, hs);
+            this.createRowHeader(bb, rn, 0, colCount, this._rowHeaderOptions(layout, 0));
+            const headerStyle = this._headerStyleIndex(layout);
+            const baseHeader = layout.headerStyle ?? { font: { bold: true } };
+            for (let c = 0; c < headers.length; c++) {
+                const rangeStyle = layout.styleRanges.styleFor(0, c);
+                const style = rangeStyle
+                    ? this._styles.register(mergeCellStyles(baseHeader, rangeStyle))
+                    : headerStyle;
+                this.writeString(bb, headers[c], c, 0, style);
+            }
             rn++;
         }
-        
+
         for (let r = 0; r < rows.length; r++) {
-            this.createRowHeader(bb, rn, 0, colCount);
-            for (let c = 0; c < rows[r].length; c++) this._writeCell(bb, rows[r][c], c);
+            this.createRowHeader(bb, rn, 0, colCount, this._rowHeaderOptions(layout, rn));
+            for (let c = 0; c < rows[r].length; c++) {
+                this._writeCell(bb, rows[r][c], c, layout.styleRanges.styleFor(rn, c));
+            }
             rn++;
         }
-        
-        bb.write(this._sheet1Bytes.subarray(218, 290));
-        
+
+        const sheetHeader = new Uint8Array(this._sheet1Bytes);
+        applyXlsbSheetProtection(sheetHeader, layout.sheetProtection);
+        bb.write(sheetHeader.subarray(218, 290));
+
         if (doAf) {
             this._autofilterIsOn = true;
             bb.write(this._autoFilterStartBytes);
@@ -525,47 +873,83 @@ export class BrowserXlsbWriter {
             const cBuf = new Uint8Array(8), cView = new DataView(cBuf.buffer);
             cView.setInt32(0, 0, true); cView.setInt32(4, colCount - 1, true); bb.write(cBuf);
             bb.write(this._autoFilterEndBytes);
-            this._sheetList[this._sheetCount - 1].filterData = {
+            sheet.filterData = {
                 startRow: 0, endRow: rn - 1, startColumn: 0, endColumn: colCount - 1
             };
         }
 
         this._writeFeatureRecords(bb, sheet);
+        this._writeSheetFooterRecords(bb, sheet, sheetHeader);
 
-        bb.write(this._sheet1Bytes.subarray(290));
         bb.patchInt32LE(36, Math.max(0, rn - 1));
-        this._zip.addFile(this._sheetList[this._sheetCount - 1].pathInArchive, bb.toUint8Array());
+        this._zip.addFile(sheet.pathInArchive, bb.toUint8Array());
     }
 
-    _writeSheetHeader(bb: BrowserBigBuffer, startCol: number, endCol: number, doAf: boolean): void {
+    _writeSheetHeader(bb: BrowserBigBuffer, startCol: number, endCol: number, _doAf = false): void {
+        const layout = this._sheetList[this._sheetCount - 1]?.layout;
         const sh = new Uint8Array(this._sheet1Bytes);
+        applyXlsbSheetProtection(sh, layout?.sheetProtection);
         const shView = new DataView(sh.buffer);
         shView.setInt32(40, startCol, true);
         shView.setInt32(44, endCol - 1, true);
-        if (this._sheetCount !== 1) sh[54] = 0x9C;
-        
-        bb.write(sh.subarray(0, 84));
-        if (doAf) bb.write(this._stickHeaderA1bytes);
-        bb.write(sh.subarray(84, 159));
-        
-        bb.writeByte(134); bb.writeByte(3); bb.writeByte(0);
-        for (let i = startCol; i < endCol; i++) {
-            bb.writeByte(60); bb.writeByte(18);
-            bb.writeInt32LE(i); bb.writeInt32LE(i);
-            const w = defaultColWidth(this._colWidths[i]);
-            bb.writeInt32LE(Math.max(0, Math.min(255 * 256, Math.round(w * 256))));
-            bb.writeInt32LE(0);
-            bb.writeByte(2); bb.writeByte(0);
+
+        if (layout?.tabColor !== undefined) {
+            sh.set(xlsbColorPayload(layout.tabColor), 9);
         }
-        bb.writeByte(135); bb.writeByte(3); bb.writeByte(0);
+
+        let viewFlags = this._sheetCount === 1 ? 0xDC : 0x9C;
+        if (layout?.showGridLines === false) viewFlags &= ~0x04;
+        if (layout?.showRowColHeaders === false) viewFlags &= ~0x08;
+        if (layout?.showZeroValues === false) viewFlags &= ~0x10;
+        if (layout?.rightToLeft) viewFlags |= 0x20;
+        sh[54] = viewFlags;
+
+        bb.write(sh.subarray(0, 55));
+        let viewTail = sh.subarray(55, 84);
+        if (layout?.zoom !== undefined) {
+            const scale = new Uint8Array(4);
+            const scaleView = new DataView(scale.buffer);
+            scaleView.setUint16(0, layout.zoom, true);
+            scaleView.setUint16(2, layout.zoom, true);
+            const merged = new Uint8Array(viewTail.length);
+            merged.set(viewTail.subarray(0, 17), 0);
+            merged.set(scale, 17);
+            merged.set(viewTail.subarray(21), 21);
+            viewTail = merged;
+        }
+        bb.write(viewTail);
+
+        bb.write(buildXlsbPaneRecord(layout?.freezePanes ?? null));
+        bb.write(buildXlsbSelectionRecord(layout?.freezePanes ?? null));
+        bb.write(sh.subarray(123, 157));
+        bb.write(new Uint8Array([
+            layout?.rowOutline.maxLevel ?? 0,
+            layout?.columnOutline.maxLevel ?? 0,
+        ]));
+
+        const widths = this._colWidths.map(width => defaultColWidth(width));
+        bb.write(buildXlsbColumnRecords({
+            startCol,
+            endCol,
+            widths,
+            hiddenColumns: layout?.hiddenColumns ?? [],
+            outline: layout?.columnOutline,
+        }));
+
         bb.write(sh.subarray(159, 175));
         bb.write(new Uint8Array([38, 0]));
     }
 
-    _writeCell(bb: BrowserBigBuffer, raw: CellValue, c: number): void {
+    _writeCell(
+        bb: BrowserBigBuffer,
+        raw: CellValue,
+        c: number,
+        extraStyle?: CellStyle | null,
+    ): void {
         if (raw === null || raw === undefined) return;
 
-        const style = getCellStyle(raw);
+        const cellStyle = getCellStyle(raw);
+        const style = extraStyle ? mergeCellStyles(cellStyle, extraStyle) : cellStyle;
         let styleNum = style !== null ? this._styles.register(style) : 0;
 
         const formula = getFormula(raw);
@@ -574,7 +958,7 @@ export class BrowserXlsbWriter {
             let cached: string | number | boolean | ExcelError | null | undefined;
             if (rawCached instanceof Date) {
                 cached = timeToOaDate(rawCached.getTime(), this._oaEpoch);
-                if (styleNum === 0) styleNum = dateHasTime(rawCached) ? 2 : 1;
+                if (styleNum === 0) styleNum = dateHasTime(rawCached) ? 1 : 2;
             } else if (isRichText(rawCached)) {
                 cached = rawCached.toString();
             } else if (typeof rawCached === 'bigint') {
@@ -589,7 +973,8 @@ export class BrowserXlsbWriter {
         const val = unwrapCell(raw);
         if (val === null || val === undefined) return;
         if (isRichText(val)) {
-            throw new Error('Rich text is not supported by BrowserXlsbWriter yet; use BrowserXlsxWriter.');
+            this._writeRichText(bb, val, c, styleNum);
+            return;
         }
 
         if (typeof val === 'number') {
@@ -606,15 +991,22 @@ export class BrowserXlsbWriter {
             this.writeBool(bb, val, c, styleNum);
         } else if (val instanceof Date) {
             const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
-            const dateStyle = dateHasTime(val) ? 2 : 1;
+            // Base XF 1 carries the date-time format, XF 2 the date-only one.
+            const dateStyle = dateHasTime(val) ? 1 : 2;
             this.writeDouble(bb, oaDate, c, styleNum !== 0 ? styleNum : dateStyle);
         } else {
             this.writeString(bb, val.toString(), c, 0, styleNum);
         }
     }
 
-    createRowHeader(bb: BrowserBigBuffer, rn: number, sc: number, ec: number): void {
-        writeXlsbRowHeader(bb, rn, sc, ec);
+    createRowHeader(
+        bb: BrowserBigBuffer,
+        rn: number,
+        sc: number,
+        ec: number,
+        options: import('../writers/core/xlsbRecords').XlsbRowHeaderOptions = {},
+    ): void {
+        writeXlsbRowHeader(bb, rn, sc, ec, options);
     }
     writeRkNumberInteger(bb: BrowserBigBuffer, val: number, colNum: number, styleNum = 0): void {
         writeXlsbRkInteger(bb, val, colNum, styleNum);
@@ -629,8 +1021,39 @@ export class BrowserXlsbWriter {
         writeXlsbError(bb, code, colNum, styleNum);
     }
     writeDateTime(bb: BrowserBigBuffer, date: Date, colNum: number): void {
-        this.writeDouble(bb, timeToOaDate(date.getTime(), this._oaEpoch), colNum, dateHasTime(date) ? 2 : 1);
+        this.writeDouble(bb, timeToOaDate(date.getTime(), this._oaEpoch), colNum, dateHasTime(date) ? 1 : 2);
     }
+    private _writeRichText(
+        bb: BrowserBigBuffer,
+        value: import('../Formats').RichText,
+        colNum: number,
+        styleNum: number,
+    ): void {
+        if (!this._useSharedStrings) {
+            // BrtCellSt can only hold plain text; keep the text, drop the runs.
+            this.writeString(bb, value.toString(), colNum, 0, styleNum);
+            return;
+        }
+        const runs: Array<{ ich: number; ifnt: number }> = [];
+        let offset = 0;
+        for (const run of value.runs) {
+            runs.push({ ich: offset, ifnt: this._styles.registerRichFont(run.style?.font) });
+            offset += run.text.length;
+        }
+        const text = value.toString();
+        assertCellTextLength(text);
+        const key = JSON.stringify({ text, runs });
+        let index = this._sstRichDic.get(key);
+        if (index === undefined) {
+            index = this._sstValues.length;
+            this._sstRichDic.set(key, index);
+            this._sstValues.push({ text, runs });
+            this._sstCntUnique++;
+        }
+        this._sstCntAll++;
+        writeXlsbIsst(bb, index, colNum, styleNum);
+    }
+
     writeString(bb: BrowserBigBuffer, val: string, colNum: number, styleIndex = 0, styleOverride?: number): void {
         assertCellTextLength(val);
         const finalStyle = styleOverride !== undefined ? styleOverride : styleIndex;
@@ -640,8 +1063,10 @@ export class BrowserXlsbWriter {
         }
         let index = this._sstDic.get(val);
         if (index === undefined) {
-            index = this._sstCntUnique++;
+            index = this._sstValues.length;
             this._sstDic.set(val, index);
+            this._sstValues.push(val);
+            this._sstCntUnique++;
         }
         this._sstCntAll++;
         writeXlsbIsst(bb, index, colNum, finalStyle);
@@ -649,7 +1074,7 @@ export class BrowserXlsbWriter {
 
     _saveSst(): void {
         const bb = new BrowserBigBuffer();
-        writeXlsbSharedStrings(bb, this._sstDic.keys(), this._sstCntAll, this._sstCntUnique);
+        writeXlsbSharedStrings(bb, this._sstValues, this._sstCntAll, this._sstCntUnique);
         this._zip.addFile('xl/sharedStrings.bin', bb.toUint8Array());
     }
 
@@ -670,6 +1095,11 @@ export class BrowserXlsbWriter {
     finalize(): Blob {
         this._saveSst();
         this._zip.addFile('xl/styles.bin', this._buildStylesBin());
+        for (const sheet of this._sheetList) {
+            for (const part of sheet.extraParts ?? []) {
+                this._zip.addFile(part.name, new Uint8Array(part.data));
+            }
+        }
         
         const wbBuffers = [this._workbookBinStart];
         for (const sheet of this._sheetList) {
@@ -718,25 +1148,38 @@ export class BrowserXlsbWriter {
         
         for (const s of this._sheetList) this._zip.addFile(`xl/worksheets/binaryIndex${s.sheetId}.bin`, this._binaryIndexBin);
         
+        const hasComments = this._sheetList.some(sheet => (sheet.comments?.length ?? 0) > 0);
         let ct = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="bin" ContentType="application/vnd.ms-excel.sheet.binary.macroEnabled.main"/>
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 <Default Extension="xml" ContentType="application/xml"/>`;
+        if (hasComments) {
+            ct += '<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>';
+        }
         for (const s of this._sheetList) {
             ct += `<Override PartName="/${s.pathInArchive}" ContentType="application/vnd.ms-excel.worksheet"/>`;
             ct += `<Override PartName="/xl/worksheets/binaryIndex${s.sheetId}.bin" ContentType="application/vnd.ms-excel.binIndexWs"/>`;
+            for (const part of s.tableParts ?? []) {
+                ct += `<Override PartName="/${part.path}" ContentType="application/vnd.ms-excel.table"/>`;
+            }
+            if ((s.comments?.length ?? 0) > 0) {
+                ct += `<Override PartName="/xl/comments/comment${s.sheetId}.bin" ContentType="application/vnd.ms-excel.comments"/>`;
+            }
         }
         ct += `<Override PartName="/xl/styles.bin" ContentType="application/vnd.ms-excel.styles"/>
 <Override PartName="/xl/sharedStrings.bin" ContentType="application/vnd.ms-excel.sharedStrings"/>
+<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
 </Types>`;
         this._zip.addFile('[Content_Types].xml', ct);
+        this._zip.addFile('xl/theme/theme1.xml', XLSX_THEME_XML);
 
         let wr = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`;
         for (const s of this._sheetList) wr += `<Relationship Id="rId${s.sheetId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/${s.nameInArchive}"/>`;
         wr += `<Relationship Id="rId${this._sheetList.length + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.bin"/>
 <Relationship Id="rId${this._sheetList.length + 3}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.bin"/>
+<Relationship Id="rId${this._sheetList.length + 4}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
 </Relationships>`;
         this._zip.addFile('xl/_rels/workbook.bin.rels', wr);
 
@@ -752,6 +1195,15 @@ export class BrowserXlsbWriter {
             for (const link of s.hyperlinks ?? []) {
                 if (!link.rId || link.spec.target === undefined) continue;
                 ws += `<Relationship Id="${link.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXmlText(link.spec.target)}" TargetMode="External"/>`;
+            }
+            for (const part of s.tableParts ?? []) {
+                ws += `<Relationship Id="${part.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/${part.path.split('/').pop()}"/>`;
+            }
+            if (s.commentRId !== undefined) {
+                ws += `<Relationship Id="${s.commentRId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment${s.sheetId}.bin"/>`;
+            }
+            if (s.commentVmlRId !== undefined) {
+                ws += `<Relationship Id="${s.commentVmlRId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/commentsDrawing${s.sheetId}.vml"/>`;
             }
             ws += '</Relationships>';
             this._zip.addFile(`xl/worksheets/_rels/${s.nameInArchive}.rels`, ws);

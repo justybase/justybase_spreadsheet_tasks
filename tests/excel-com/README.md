@@ -42,3 +42,6 @@ Without `EXCEL_COM=1` the suite is skipped. With `EXCEL_COM=1` but no Excel or
 | `conformance.test.ts` | Node test runner that writes cases, calls Excel and asserts |
 | `stage2.test.ts` | Etap 2 checks: styles, formulas, merges, links, validation, CF, comments, widths |
 | `Verify-Stage2.ps1` | Opens the Etap 2 workbooks and returns their Excel properties as JSON |
+| `full-features.test.ts` | Runs the module scripts of `browser/demo.html` and `browser/test.html`, keeps every download and verifies its features |
+| `run-browser-page.mjs` | Child-process harness that executes a page outside a browser and writes its downloads |
+| `Verify-Generated.ps1` | Opens every generated file and checks sheets, tables, totals, CF priorities, comments, protection and validations |

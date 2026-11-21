@@ -22,6 +22,8 @@ const BRT_FMT = 0x002c;
 const BRT_FILL = 0x002d;
 const BRT_BORDER = 0x002e;
 const BRT_XF = 0x002f;
+const BRT_BEGIN_DXFS = 0x01f9;
+const BRT_END_DXFS = 0x01fa;
 
 const BRT_BEGIN_FMTS = 0x0267;
 const BRT_END_FMTS = 0x0268;
@@ -145,6 +147,7 @@ function colorBytes(color: StyleColor | undefined): number[] {
     if ('indexed' in color) {
         return [0x03, color.indexed & 0xff, 0, 0, 0, 0, 0, 0xff];
     }
+    if ('auto' in color) return [0x01, 0, 0, 0, 0, 0, 0, 0xff];
     const tint = Math.max(-32768, Math.min(32767, Math.round((color.tint ?? 0) * 32767)));
     return [0x07, color.theme & 0xff, ...u16(tint), 0, 0, 0, 0xff];
 }
@@ -194,8 +197,45 @@ export function buildXlsbFontRecord(font: FontStyle): Uint8Array {
     return buildBrtRecord(BRT_FONT, Uint8Array.from(payload));
 }
 
+function doubleBytes(value: number): number[] {
+    const buffer = new ArrayBuffer(8);
+    new DataView(buffer).setFloat64(0, value, true);
+    return [...new Uint8Array(buffer)];
+}
+
+function gradientFillPayload(fill: FillStyle): Uint8Array {
+    const gradient = fill.gradient!;
+    const linear = (gradient.type ?? 'linear') === 'linear';
+    const payload: number[] = [
+        ...u32(0x28),
+        ...colorBytes(undefined),
+        ...colorBytes(undefined),
+        ...u32(linear ? 0 : 1),
+    ];
+    const angle = linear && gradient.degree !== undefined ? (360 - gradient.degree) % 360 : 0;
+    payload.push(...doubleBytes(angle));
+    if (linear) {
+        payload.push(...doubleBytes(0), ...doubleBytes(0), ...doubleBytes(0), ...doubleBytes(0));
+    } else {
+        payload.push(
+            ...doubleBytes(gradient.left ?? 0),
+            ...doubleBytes(gradient.right ?? 1),
+            ...doubleBytes(gradient.top ?? 0),
+            ...doubleBytes(gradient.bottom ?? 1),
+        );
+    }
+    payload.push(...u32(gradient.stops.length));
+    for (const stop of gradient.stops) {
+        payload.push(...colorBytes(stop.color), ...doubleBytes(stop.position));
+    }
+    return Uint8Array.from(payload);
+}
+
 /** BrtFill ([MS-XLSB] 2.4.674). */
 export function buildXlsbFillRecord(fill: FillStyle): Uint8Array {
+    if (fill.gradient) {
+        return buildBrtRecord(BRT_FILL, gradientFillPayload(fill));
+    }
     const payload: number[] = [
         ...u32(PATTERN_BYTES[fill.patternType ?? 'none'] ?? 0),
         ...colorBytes(fill.fgColor),
@@ -212,6 +252,11 @@ function borderSide(side: BorderSide | undefined): number[] {
 
 /** BrtBorder ([MS-XLSB] 2.4.311). */
 export function buildXlsbBorderRecord(border: BorderStyle): Uint8Array {
+    for (const side of ['start', 'end', 'vertical', 'horizontal'] as const) {
+        if (border[side] !== undefined) {
+            throw new Error(`XLSB has no record slot for the '${side}' border side; use XlsxWriter`);
+        }
+    }
     let diagonal = 0;
     if (border.diagonalDown) diagonal |= 0x01;
     if (border.diagonalUp) diagonal |= 0x02;
@@ -237,6 +282,12 @@ interface XlsbXfOptions {
 /** BrtXF ([MS-XLSB] 2.4.863). */
 export function buildXlsbXfRecord(options: XlsbXfOptions): Uint8Array {
     const { ifmt = 0, fontId = 0, fillId = 0, borderId = 0, style } = options;
+    if (style?.quotePrefix) {
+        throw new Error('XLSB has no record slot for quotePrefix; use XlsxWriter');
+    }
+    if (style?.pivotButton) {
+        throw new Error('XLSB has no record slot for pivotButton; use XlsxWriter');
+    }
     const alignment = style?.alignment;
     const protection = style?.protection;
 
@@ -245,6 +296,9 @@ export function buildXlsbXfRecord(options: XlsbXfOptions): Uint8Array {
     let alignmentByte = 0x10;
     let flagsByte = 0x10;
     if (alignment) {
+        if (alignment.relativeIndent !== undefined) {
+            throw new Error('XLSB has no record slot for relativeIndent; use XlsxWriter');
+        }
         rotation = alignment.textRotation ?? 0;
         indent = alignment.indent ?? 0;
         alignmentByte = (HORIZONTAL_BYTES[alignment.horizontal ?? 'general'] ?? 0)
@@ -416,6 +470,25 @@ export class XlsbStyleRegistry {
         return this.register({ numFmt: format });
     }
 
+    /** Number-format id for a differential style (no new XF is allocated). */
+    registerNumberFormat(format: string): number {
+        return this.numFmtIdFor(format);
+    }
+
+    /** Font-table id for one rich-text run (shared with cell-style fonts). */
+    registerRichFont(font: FontStyle | null | undefined): number {
+        if (!font || Object.keys(font).length === 0) return 0;
+        const key = JSON.stringify(font);
+        return this.componentId(
+            this.fontIds,
+            key,
+            buildXlsbFontRecord(font),
+            this.fonts,
+            font.bold && Object.keys(font).length === 1 ? 1 : null,
+            () => this.nextFontId++,
+        );
+    }
+
     private numFmtIdFor(format: string): number {
         let id = this.formats.get(format);
         if (id === undefined) {
@@ -450,11 +523,16 @@ export class XlsbStyleRegistry {
         return id;
     }
 
-    /** Rewrite `styles.bin`, appending registered components to the template. */
-    toStylesBin(template: Uint8Array): Uint8Array {
+    /**
+     * Rewrite `styles.bin`, appending registered components to the template.
+     * `dxfRecords` are the BrtBeginDXFs…BrtEndDXFs bytes for conditional
+     * formats; they replace the template's empty DXF section.
+     */
+    toStylesBin(template: Uint8Array, dxfRecords?: Uint8Array): Uint8Array {
         if (this.xfs.length === 0 && this.fonts.length === 0
             && this.fills.length === 0 && this.borders.length === 0
-            && this.formatRecords.length === 0) {
+            && this.formatRecords.length === 0
+            && (!dxfRecords || dxfRecords.length === 0)) {
             return template;
         }
 
@@ -498,7 +576,15 @@ export class XlsbStyleRegistry {
         for (const record of cellXfs.inner) parts.push(template.subarray(record.start, record.end));
         for (const xf of this.xfs) parts.push(xf);
         parts.push(template.subarray(cellXfs.end.start, cellXfs.end.end));
-        parts.push(template.subarray(cellXfs.end.end));
+
+        if (dxfRecords && dxfRecords.length > 0) {
+            const dxfs = section(BRT_BEGIN_DXFS, BRT_END_DXFS);
+            parts.push(template.subarray(cellXfs.end.end, dxfs.begin.start));
+            parts.push(dxfRecords);
+            parts.push(template.subarray(dxfs.end.end));
+        } else {
+            parts.push(template.subarray(cellXfs.end.end));
+        }
 
         return concat(parts);
     }

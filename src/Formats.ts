@@ -13,8 +13,12 @@ export class ExcelError {
 
 export type PrimitiveCellValue = string | number | boolean | Date | bigint | ExcelError | null | undefined;
 
-/** RGB/ARGB hex (`'FF0000'`, `'#FF0000'`, `'FFFF0000'`) or an indexed/theme color. */
-export type StyleColor = string | { indexed: number } | { theme: number; tint?: number };
+/** RGB/ARGB hex (`'FF0000'`, `'#FF0000'`, `'FFFF0000'`) or an indexed/theme/automatic color. */
+export type StyleColor =
+    | string
+    | { indexed: number }
+    | { theme: number; tint?: number }
+    | { auto: true };
 
 export type FontUnderline = 'single' | 'double' | 'singleAccounting' | 'doubleAccounting';
 
@@ -42,10 +46,31 @@ export type PatternType =
     | 'darkTrellis' | 'lightHorizontal' | 'lightVertical' | 'lightDown'
     | 'lightUp' | 'lightGrid' | 'lightTrellis' | 'gray125' | 'gray0625';
 
+export interface GradientStop {
+    color: StyleColor;
+    /** Position between 0 and 1. */
+    position: number;
+}
+
+/** Excel gradient fill (`linear` or `path`). */
+export interface GradientFillStyle {
+    type?: 'linear' | 'path';
+    /** Linear gradient angle in degrees (0-360). */
+    degree?: number;
+    /** Path-gradient inner-rectangle insets, each 0..1. */
+    left?: number;
+    right?: number;
+    top?: number;
+    bottom?: number;
+    stops: GradientStop[];
+}
+
 export interface FillStyle {
     patternType?: PatternType;
     fgColor?: StyleColor;
     bgColor?: StyleColor;
+    /** A gradient fill overrides `patternType`/`fgColor`/`bgColor`. */
+    gradient?: GradientFillStyle;
 }
 
 export type BorderLineStyle =
@@ -64,6 +89,11 @@ export interface BorderStyle {
     left?: BorderSide;
     right?: BorderSide;
     diagonal?: BorderSide;
+    /** OpenXML-only sides; XLSB has no record slots for them. */
+    start?: BorderSide;
+    end?: BorderSide;
+    vertical?: BorderSide;
+    horizontal?: BorderSide;
     diagonalUp?: boolean;
     diagonalDown?: boolean;
     outline?: boolean;
@@ -75,6 +105,8 @@ export interface AlignmentStyle {
     wrapText?: boolean;
     shrinkToFit?: boolean;
     indent?: number;
+    /** OpenXML-only relative indent; XLSB has no record slot for it. */
+    relativeIndent?: number;
     textRotation?: number;
     justifyLastLine?: boolean;
     readingOrder?: 0 | 1 | 2;
@@ -93,6 +125,10 @@ export interface CellStyle {
     border?: BorderStyle;
     alignment?: AlignmentStyle;
     protection?: ProtectionStyle;
+    /** OpenXML `quotePrefix` cell flag. */
+    quotePrefix?: boolean;
+    /** OpenXML `pivotButton` cell flag. */
+    pivotButton?: boolean;
 }
 
 export interface StyledCell {
@@ -196,6 +232,38 @@ export function getCellStyle(val: CellValue): CellStyle | null {
 export function mergeCellStyle(base: CellStyle | null | undefined, extra: CellStyle | null | undefined): CellStyle | null {
     if (!base && !extra) return null;
     return { ...(base ?? {}), ...(extra ?? {}) };
+}
+
+function definedEntries<T extends object>(value: T | null | undefined): Array<[string, unknown]> {
+    if (!value) return [];
+    return Object.entries(value).filter(([, item]) => item !== undefined);
+}
+
+/**
+ * Merge two styles component by component: `extra` wins for every property it
+ * sets, while nested font/fill/border/alignment/protection objects are merged
+ * instead of replaced. This is what range styles and per-cell styles need.
+ */
+export function mergeCellStyles(
+    base: CellStyle | null | undefined,
+    extra: CellStyle | null | undefined,
+): CellStyle | null {
+    if (!base && !extra) return null;
+    const out: CellStyle = { ...(base ?? {}) };
+    for (const [key, value] of definedEntries(extra)) {
+        if (value === undefined) continue;
+        if (key === 'font' || key === 'fill' || key === 'border'
+            || key === 'alignment' || key === 'protection') {
+            const current = out[key as keyof CellStyle] as Record<string, unknown> | undefined;
+            out[key as keyof CellStyle] = {
+                ...(current ?? {}),
+                ...(value as Record<string, unknown>),
+            } as never;
+        } else {
+            (out as Record<string, unknown>)[key] = value;
+        }
+    }
+    return out;
 }
 
 export function getFormula(val: CellValue): string | null {

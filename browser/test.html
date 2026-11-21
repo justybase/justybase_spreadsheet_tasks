@@ -19,7 +19,7 @@
     <button id="btnDownload" style="display:none; padding: 10px; margin-top: 10px; cursor: pointer;">Download Generated Test Files</button>
 
     <script type="module">
-        import { BrowserXlsxWriter, BrowserXlsbWriter } from './browser-spreadsheet.js';
+        import { BrowserXlsxWriter, BrowserXlsbWriter, RichText } from './browser-spreadsheet.js';
         import { F } from './browser-spreadsheet.js';
 
         const resultsDiv = document.getElementById('results');
@@ -201,6 +201,460 @@
                     generatedBlobs['multi_15_filter.xlsx'] = multiXlsxBlob;
                 } else {
                     log("15-sheet XLSX returned empty blob.", true);
+                }
+
+                // Full styling/layout/feature coverage for both writers.
+                const featureHeaders = ['Product', 'Units', 'Price', 'Total', 'Trend', 'Notes'];
+                const featureRows = [
+                    ['Laptop', 12, 4999.0, 59988.0, 0.12,
+                        new RichText([
+                            { text: 'best ', style: { font: { bold: true, color: 'FF2E7D32' } } },
+                            { text: 'seller' },
+                        ])],
+                    ['Monitor', 30, 1299.0, 38970.0, -0.05, '4K IPS'],
+                    ['Keyboard', 75, 199.0, 14925.0, 0.08, 'mechanical'],
+                    [],
+                    ['Summary across A6:F6'],
+                ];
+                function buildFeatureWorkbook(writer) {
+                    writer.addSheet('Features');
+                    writer.writeSheet(featureRows, featureHeaders, {
+                        headerStyle: {
+                            font: { bold: true, color: 'FFFFFFFF' },
+                            fill: { patternType: 'solid', fgColor: 'FF1F4E78' },
+                            alignment: { horizontal: 'center' },
+                        },
+                        rowHeights: { 0: 30, 1: 24, 3: 32 },
+                        hiddenRows: [3],
+                        hiddenColumns: [5],
+                        rowGroups: [{ start: 1, end: 2 }],
+                        columnGroups: [{ start: 2, end: 3 }],
+                        freezePanes: 'B2',
+                        showGridLines: false,
+                        showRowColHeaders: false,
+                        showZeroValues: false,
+                        rightToLeft: true,
+                        zoom: 120,
+                        tabColor: 'FF1F4E78',
+                        styles: {
+                            'A2:A3': { font: { bold: true } },
+                            'B2:B3': { numFmt: '#,##0' },
+                            'C2:D3': { numFmt: '#,##0.00 "PLN"' },
+                            'E2:E3': { numFmt: '0.0%' },
+                            'F2:F3': {
+                                alignment: { wrapText: true },
+                                fill: {
+                                    gradient: {
+                                        type: 'path', left: 0.1, right: 0.1, top: 0.1, bottom: 0.1,
+                                        stops: [
+                                            { color: 'FFFFF2CC', position: 0 },
+                                            { color: 'FF70AD47', position: 1 },
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                        tables: [{
+                            name: 'FeatureTable', ref: 'A1:F4',
+                            columns: featureHeaders, styleName: 'TableStyleMedium2',
+                            showFirstColumn: true, showRowStripes: true, showColumnStripes: true,
+                        }],
+                        conditionalFormats: [
+                            {
+                                sqref: 'B2:B4',
+                                rules: [
+                                    {
+                                        type: 'cellIs', operator: 'greaterThan', formula: ['20'],
+                                        style: {
+                                            fill: { patternType: 'solid', fgColor: 'FFFFC7CE' },
+                                            font: { bold: true, color: 'FF9C0006' },
+                                        },
+                                    },
+                                    { type: 'dataBar', cfvo: [{ type: 'min' }, { type: 'max' }], color: 'FF638EC6' },
+                                ],
+                            },
+                            {
+                                sqref: 'C2:C4',
+                                rules: [{ type: 'colorScale', cfvo: [{ type: 'min' }, { type: 'max' }], colors: ['FFF8696B', 'FF63BE7B'] }],
+                            },
+                            {
+                                sqref: 'E2:E4',
+                                rules: [{ type: 'iconSet', cfvo: [{ type: 'percent', value: '50' }] }],
+                            },
+                            {
+                                sqref: 'F2:F4',
+                                rules: [{ type: 'expression', formula: 'LEN(F2)>10', style: { font: { italic: true } } }],
+                            },
+                        ],
+                        comments: [
+                            { ref: 'A6', text: 'Feature note', author: 'Tester' },
+                            { ref: 'E2', text: 'Percentage and icon-set demo.', author: 'Tester' },
+                        ],
+                        merges: ['A6:F6'],
+                        hyperlinks: [
+                            { ref: 'B8', target: 'https://example.com' },
+                            { ref: 'D8', location: "'Features'!A1", tooltip: 'Back to top' },
+                        ],
+                        dataValidations: [{
+                            sqref: 'E2:E3', type: 'list', values: ['High', 'Low'], allowBlank: true,
+                            promptTitle: 'Trend', prompt: 'Choose High or Low',
+                        }],
+                        sheetProtection: {
+                            enabled: true, password: 'demo',
+                            selectLockedCells: true, selectUnlockedCells: true,
+                            objects: false, formatCells: true, insertRows: true,
+                        },
+                        doAutofilter: false,
+                    });
+
+                    writer.addSheet('Conditional Formats');
+                    writer.writeSheet([
+                        [10, 1, 95, 'A', 'A', 'abc one', 'plain', 'prefix', 'suffix', 10, 10, 10],
+                        [20, 2, 80, 'B', 'B', 'abc two', 'abc plain', 'presto', 'the end', 20, 20, 20],
+                        [30, 3, 70, 'A', 'A', 'nothing', 'abc hidden', 'nope', 'endless', 30, 30, 30],
+                        [40, 4, 60, 'C', 'C', 'abc four', 'plain', 'prelude', 'offend', 40, 40, 40],
+                        [50, 5, 50, 'A', 'A', 'abc five', 'abc', 'pre', 'end', 50, 50, 50],
+                        [60, 6, 40, 'D', 'D', 'abc six', 'plain', 'post', 'ending', 60, 60, 60],
+                    ], [
+                        'CellIs', 'Expression', 'Top10', 'Duplicates', 'Unique', 'Contains',
+                        'Not contains', 'Begins', 'Ends', 'Color scale', 'Data bar', 'Icons',
+                    ], {
+                        headerStyle: {
+                            font: { bold: true, color: 'FFFFFFFF' },
+                            fill: { patternType: 'solid', fgColor: 'FF3F51B5' },
+                            alignment: { horizontal: 'center', wrapText: true },
+                        },
+                        rowHeights: { 0: 36 },
+                        freezePanes: 'A2',
+                        tabColor: 'FF3F51B5',
+                        styles: { 'A2:L7': { alignment: { horizontal: 'center' } } },
+                        conditionalFormats: [
+                            {
+                                sqref: 'A2:A7',
+                                rules: [{
+                                    type: 'cellIs', operator: 'greaterThan', formula: ['40'],
+                                    stopIfTrue: true,
+                                    style: {
+                                        fill: { patternType: 'solid', fgColor: 'FFFFC7CE' },
+                                        font: { bold: true, color: 'FF9C0006' },
+                                    },
+                                }],
+                            },
+                            {
+                                sqref: 'B2:B7',
+                                rules: [{
+                                    type: 'expression', formula: 'MOD(B2,2)=0',
+                                    style: { fill: { patternType: 'solid', fgColor: 'FFDDEBF7' } },
+                                }],
+                            },
+                            {
+                                sqref: 'C2:C7',
+                                rules: [{
+                                    type: 'top10', rank: 30, percent: true, bottom: true,
+                                    style: { fill: { patternType: 'solid', fgColor: 'FFFFEB9C' } },
+                                }],
+                            },
+                            {
+                                sqref: 'D2:D7',
+                                rules: [{
+                                    type: 'duplicateValues',
+                                    style: { fill: { patternType: 'solid', fgColor: 'FFFFF2CC' } },
+                                }],
+                            },
+                            {
+                                sqref: 'E2:E7',
+                                rules: [{
+                                    type: 'uniqueValues',
+                                    style: { fill: { patternType: 'solid', fgColor: 'FFC6EFCE' } },
+                                }],
+                            },
+                            {
+                                sqref: 'F2:F7',
+                                rules: [{
+                                    type: 'containsText', text: 'abc',
+                                    style: { font: { bold: true, color: 'FF1F4E78' } },
+                                }],
+                            },
+                            {
+                                sqref: 'G2:G7',
+                                rules: [{
+                                    type: 'notContainsText', text: 'abc',
+                                    style: { font: { italic: true, color: 'FF9C0006' } },
+                                }],
+                            },
+                            {
+                                sqref: 'H2:H7',
+                                rules: [{
+                                    type: 'beginsWith', text: 'pre',
+                                    style: { fill: { patternType: 'solid', fgColor: 'FFE2EFDA' } },
+                                }],
+                            },
+                            {
+                                sqref: 'I2:I7',
+                                rules: [{
+                                    type: 'endsWith', text: 'end',
+                                    style: { fill: { patternType: 'solid', fgColor: 'FFFCE4D6' } },
+                                }],
+                            },
+                            {
+                                sqref: 'J2:J7',
+                                rules: [{
+                                    type: 'colorScale',
+                                    cfvo: [{ type: 'min' }, { type: 'percentile', value: '50' }, { type: 'max' }],
+                                    colors: ['FFF8696B', 'FFFFEB84', 'FF63BE7B'],
+                                }],
+                            },
+                            {
+                                sqref: 'K2:K7',
+                                rules: [{
+                                    type: 'dataBar', cfvo: [{ type: 'min' }, { type: 'max' }],
+                                    color: 'FF638EC6',
+                                }],
+                            },
+                            {
+                                sqref: 'L2:L7',
+                                rules: [{ type: 'iconSet', iconSet: '3TrafficLights1' }],
+                            },
+                        ],
+                    });
+
+                    writer.addSheet('Tables & Validation');
+                    writer.writeSheet([
+                        ['North', 10, 20, 30, 'Open', ''],
+                        ['South', 15, 25, 40, 'Closed', ''],
+                        ['East', 20, 30, 50, 'Open', ''],
+                        ['West', 25, 35, 60, 'Closed', ''],
+                        [
+                            'Total',
+                            { formula: 'SUM(B2:B5)', value: 70 },
+                            { formula: 'SUM(C2:C5)', value: 110 },
+                            { formula: 'SUM(D2:D5)', value: 220 },
+                            null,
+                            '',
+                        ],
+                        [],
+                        ['Whole', 'Decimal', 'Date', 'Time', 'Text length', 'Custom'],
+                        [50, 12.5, new Date(2026, 0, 15), new Date(2026, 0, 1, 9, 0), 'hello',
+                            { formula: '1+1', value: 2 }],
+                    ], ['Region', 'Q1', 'Q2', 'Total', 'Status', 'Validation demo'], {
+                        headerStyle: {
+                            font: { bold: true, color: 'FFFFFFFF' },
+                            fill: { patternType: 'solid', fgColor: 'FF00B050' },
+                        },
+                        rowHeights: { 0: 26, 7: 22 },
+                        freezePanes: 'A2',
+                        tabColor: 'FF00B050',
+                        styles: { 'A9:F9': { alignment: { horizontal: 'center' } } },
+                        tables: [{
+                            name: 'RegionalTotals',
+                            ref: 'A1:E6',
+                            columns: [
+                                { name: 'Region', totalsRowLabel: 'Total' },
+                                { name: 'Q1', totalsRowFunction: 'sum' },
+                                { name: 'Q2', totalsRowFunction: 'sum' },
+                                {
+                                    name: 'Total',
+                                    totalsRowFunction: 'custom',
+                                    totalsRowFormula: 'SUM(D2:D5)',
+                                },
+                                { name: 'Status' },
+                            ],
+                            totalsRow: true,
+                            styleName: 'TableStyleMedium4',
+                            showFirstColumn: true,
+                            showRowStripes: true,
+                            showColumnStripes: true,
+                        }],
+                        dataValidations: [
+                            {
+                                sqref: 'E2:E5', type: 'list', values: ['Open', 'Closed'],
+                                allowBlank: true, showInputMessage: true, promptTitle: 'Status',
+                                prompt: 'Choose Open or Closed', showErrorMessage: true,
+                                errorTitle: 'Invalid status', error: 'Pick a value from the list',
+                            },
+                            {
+                                sqref: 'A9:A9', type: 'whole', operator: 'between',
+                                formula1: '0', formula2: '100', allowBlank: true,
+                                showErrorMessage: true, errorTitle: 'Whole number', error: '0..100',
+                            },
+                            {
+                                sqref: 'B9:B9', type: 'decimal', operator: 'between',
+                                formula1: '0', formula2: '1000', allowBlank: true,
+                            },
+                            {
+                                sqref: 'C9:C9', type: 'date', operator: 'between',
+                                formula1: 'DATE(2026,1,1)', formula2: 'DATE(2026,12,31)',
+                                allowBlank: true,
+                            },
+                            {
+                                sqref: 'D9:D9', type: 'time', operator: 'between',
+                                formula1: 'TIME(8,0,0)', formula2: 'TIME(17,0,0)',
+                                allowBlank: true,
+                            },
+                            {
+                                sqref: 'E9:E9', type: 'textLength', operator: 'lessThanOrEqual',
+                                formula1: '10', allowBlank: true,
+                            },
+                            { sqref: 'F9:F9', type: 'custom', formula1: 'F9>0', allowBlank: true },
+                        ],
+                        comments: [{
+                            ref: 'A6',
+                            text: 'Totals row generated from the table definition.',
+                            author: 'Tester',
+                        }],
+                        sheetProtection: {
+                            enabled: true, password: 'demo',
+                            selectLockedCells: true, selectUnlockedCells: true, formatCells: true,
+                        },
+                        doAutofilter: false,
+                    });
+                }
+
+                for (const [label, Writer] of [['XLSX', BrowserXlsxWriter], ['XLSB', BrowserXlsbWriter]]) {
+                    log(`Testing full feature set (${label})...`);
+                    const writer = new Writer();
+                    buildFeatureWorkbook(writer);
+                    const blob = writer.finalize();
+                    if (blob && blob.size > 0) {
+                        log(`Full feature ${label} blob generated (${blob.size} bytes).`, false, true);
+                        generatedBlobs[`features.${label.toLowerCase()}`] = blob;
+                    } else {
+                        log(`Full feature ${label} returned an empty blob.`, true);
+                    }
+                }
+
+                log("Testing ultimate styles (XLSX-only border sides and XLSB-supported styles)...");
+                const ultimate = new BrowserXlsxWriter();
+                ultimate.addSheet('Ultimate');
+                ultimate.writeSheet([
+                    ['start/end', 'vertical/horizontal', 'relative indent', 'diagonal',
+                        'quote prefix', 'pivot button'],
+                ], ['A', 'B', 'C', 'D', 'E', 'F'], {
+                    styles: {
+                        'A2:A2': {
+                            border: {
+                                start: { style: 'thick', color: 'FF00B050' },
+                                end: { style: 'thick', color: 'FFFF0000' },
+                            },
+                        },
+                        'B2:B2': {
+                            border: {
+                                vertical: { style: 'double', color: 'FF0070C0' },
+                                horizontal: { style: 'dashed', color: 'FFFFC000' },
+                            },
+                        },
+                        'C2:C2': { alignment: { horizontal: 'right', relativeIndent: 3 } },
+                        'D2:D2': {
+                            border: {
+                                diagonal: { style: 'thin', color: 'FF000000' },
+                                diagonalUp: true,
+                            },
+                        },
+                        'E2:E2': { quotePrefix: true },
+                        'F2:F2': { pivotButton: true },
+                    },
+                });
+                const ultimateBlob = ultimate.finalize();
+                if (ultimateBlob && ultimateBlob.size > 0) {
+                    log(`OOXML-only styling blob generated (${ultimateBlob.size} bytes).`, false, true);
+                    generatedBlobs['ultimate_styles.xlsx'] = ultimateBlob;
+                } else {
+                    log("OOXML-only styling returned an empty blob.", true);
+                }
+
+                const ultimateXlsb = new BrowserXlsbWriter();
+                ultimateXlsb.addSheet('Ultimate Styles');
+                ultimateXlsb.writeSheet([
+                    ['linear gradient', 'path gradient', 'font decorations', 'borders + diagonal',
+                        'alignment', 'protection'],
+                    [1234.5, 42, 'Styled', 'Frame', 'Aligned', 'Secret'],
+                    ['XLSB cannot store start/end, vertical/horizontal borders or relativeIndent.'],
+                    ['shrink to fit', 'indent 3', 'rotated 90°', 'right-to-left', 'justify last', 'pattern fill'],
+                    [0.125, 1234.5, new Date(Date.UTC(2026, 0, 15)), 1234567.89, 42, 'text'],
+                ], ['A', 'B', 'C', 'D', 'E', 'F'], {
+                    headerStyle: {
+                        font: { bold: true, size: 14, color: 'FFFFFFFF' },
+                        fill: { patternType: 'solid', fgColor: 'FF7030A0' },
+                        alignment: { horizontal: 'center' },
+                    },
+                    rowHeights: { 0: 32, 2: 44, 4: 30 },
+                    columnWidths: [24, 22, 24, 24, 24, 18],
+                    merges: ['A4:F4'],
+                    styles: {
+                        'A3:A3': {
+                            numFmt: '#,##0.00',
+                            fill: {
+                                gradient: {
+                                    type: 'linear', degree: 90,
+                                    stops: [
+                                        { color: 'FFFFFFFF', position: 0 },
+                                        { color: 'FF4472C4', position: 1 },
+                                    ],
+                                },
+                            },
+                        },
+                        'B3:B3': {
+                            fill: {
+                                gradient: {
+                                    type: 'path', left: 0.1, right: 0.1, top: 0.1, bottom: 0.1,
+                                    stops: [
+                                        { color: 'FFFFF2CC', position: 0 },
+                                        { color: 'FFED7D31', position: 0.5 },
+                                        { color: 'FF70AD47', position: 1 },
+                                    ],
+                                },
+                            },
+                        },
+                        'C3:C3': {
+                            font: {
+                                name: 'Georgia', size: 14, bold: true, italic: true,
+                                underline: true, strike: true, outline: true, shadow: true,
+                                color: 'FF7030A0', vertAlign: 'superscript',
+                            },
+                        },
+                        'D3:D3': {
+                            border: {
+                                top: { style: 'medium', color: 'FF0070C0' },
+                                bottom: { style: 'medium', color: 'FF0070C0' },
+                                left: { style: 'thick', color: 'FF00B050' },
+                                right: { style: 'thick', color: 'FFFF0000' },
+                                diagonal: { style: 'thin', color: 'FF000000' },
+                                diagonalUp: true,
+                                diagonalDown: true,
+                            },
+                        },
+                        'E3:E3': {
+                            alignment: {
+                                horizontal: 'center', vertical: 'center',
+                                wrapText: true, textRotation: 45, readingOrder: 2,
+                            },
+                        },
+                        'F3:F3': { protection: { locked: false, hidden: true } },
+                        'A5:A5': { alignment: { shrinkToFit: true } },
+                        'B5:B5': { alignment: { horizontal: 'left', indent: 3 } },
+                        'C5:C5': { alignment: { textRotation: 90 } },
+                        'D5:D5': { alignment: { readingOrder: 2 } },
+                        'E5:E5': { alignment: { horizontal: 'justify', justifyLastLine: true } },
+                        'F5:F5': {
+                            fill: { patternType: 'darkGrid', fgColor: 'FF4472C4', bgColor: 'FFFFF2CC' },
+                        },
+                        'A6:A6': { numFmt: '0.00%' },
+                        'B6:B6': { numFmt: '#,##0.00 "zł"' },
+                        'C6:C6': { numFmt: 'yyyy-mm-dd' },
+                        'D6:D6': { numFmt: '0.00E+00' },
+                        'E6:E6': { numFmt: '000000' },
+                        'F6:F6': { numFmt: '@' },
+                    },
+                    freezePanes: 'A2',
+                    tabColor: 'FF7030A0',
+                    doAutofilter: false,
+                });
+                const ultimateXlsbBlob = ultimateXlsb.finalize();
+                if (ultimateXlsbBlob && ultimateXlsbBlob.size > 0) {
+                    log(`XLSB-supported styling blob generated (${ultimateXlsbBlob.size} bytes).`, false, true);
+                    generatedBlobs['ultimate_styles.xlsb'] = ultimateXlsbBlob;
+                } else {
+                    log("XLSB-supported styling returned an empty blob.", true);
                 }
 
                 log("All tests completed without throwing errors!", false, true);

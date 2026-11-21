@@ -61,6 +61,17 @@ Writes data to the current sheet.
 - `options.merges` - Merged ranges, e.g. `['A4:B4']`
 - `options.hyperlinks` - `{ ref, target?, location?, tooltip?, display? }[]`
 - `options.dataValidations` - List, whole/decimal/date/time/text-length/custom rules
+- `options.conditionalFormats` - Cell, expression, top/bottom, duplicate/unique, text,
+  colour-scale, data-bar and icon-set rules
+- `options.comments` - Classic cell notes `{ ref, text, author? }`
+- `options.tables` - Excel ListObject tables (`TableSpec`)
+- `options.headerStyle` / `options.styles` - Header and A1/row/column range styles
+- `options.rowHeights`, `options.hiddenRows`, `options.hiddenColumns` - Row and column layout
+- `options.rowGroups`, `options.columnGroups` - Outline grouping with optional collapse
+- `options.freezePanes`, `options.showGridLines`, `options.showRowColHeaders`,
+  `options.showZeroValues`, `options.rightToLeft`, `options.zoom`, `options.tabColor` - Sheet view
+- `options.sheetProtection` - Legacy-password sheet protection and permission flags
+- `options.autoFilterRef` - Override the automatic filter range
 - `options.columnWidths` - Fixed widths in Excel character units; skips autofit
 - `options.autofit` - Set `false` to disable the conservative width heuristic
 - `options.autofitRows` - Rows measured by autofit (default 200; `0` uses headers/samples only)
@@ -137,16 +148,40 @@ interface CellStyle {
              strike?: boolean; color?: StyleColor; family?: number;
              scheme?: 'major' | 'minor'; vertAlign?: 'baseline' | 'superscript' | 'subscript';
              outline?: boolean; shadow?: boolean; condense?: boolean; extend?: boolean; charset?: number };
-    fill?: { patternType?: PatternType; fgColor?: StyleColor; bgColor?: StyleColor };
-    border?: { top?: BorderSide; bottom?: BorderSide; left?: BorderSide; right?: BorderSide;
-               diagonal?: BorderSide; diagonalUp?: boolean; diagonalDown?: boolean; outline?: boolean };
-    alignment?: { horizontal?: ...; vertical?: ...; wrapText?: boolean; shrinkToFit?: boolean;
-                  indent?: number; textRotation?: number; justifyLastLine?: boolean; readingOrder?: 0 | 1 | 2 };
+    fill?: {
+        patternType?: PatternType;
+        fgColor?: StyleColor;
+        bgColor?: StyleColor;
+        gradient?: {
+            type?: 'linear' | 'path';
+            degree?: number;
+            left?: number; right?: number; top?: number; bottom?: number;
+            stops: Array<{ color: StyleColor; position: number }>;
+        };
+    };
+    border?: {
+        top?: BorderSide; bottom?: BorderSide; left?: BorderSide; right?: BorderSide;
+        diagonal?: BorderSide;
+        // OpenXML-only sides; XLSB throws for them.
+        start?: BorderSide; end?: BorderSide; vertical?: BorderSide; horizontal?: BorderSide;
+        diagonalUp?: boolean; diagonalDown?: boolean; outline?: boolean;
+    };
+    alignment?: {
+        horizontal?: 'general' | 'left' | 'center' | 'right' | 'fill' | 'justify'
+            | 'centerContinuous' | 'distributed';
+        vertical?: 'top' | 'center' | 'bottom' | 'justify' | 'distributed';
+        wrapText?: boolean; shrinkToFit?: boolean; indent?: number;
+        relativeIndent?: number; // OpenXML-only; XLSB throws
+        textRotation?: number; justifyLastLine?: boolean; readingOrder?: 0 | 1 | 2;
+    };
     protection?: { locked?: boolean; hidden?: boolean };
+    quotePrefix?: boolean; // OpenXML-only cell flag
+    pivotButton?: boolean; // OpenXML-only cell flag
 }
 ```
 
-`StyleColor` is `RRGGBB`, `AARRGGBB`, `#RRGGBB`, `{ indexed }` or `{ theme, tint? }`.
+`StyleColor` is `RRGGBB`, `AARRGGBB`, `#RRGGBB`, `{ indexed }`,
+`{ theme, tint? }` or `{ auto: true }`.
 
 ### `StyledCell`, `FormulaCell` and `RichText`
 
@@ -165,22 +200,103 @@ new RichText([
 ### `XlsxSheetOptions`
 
 ```typescript
-interface XlsxSheetOptions {
+interface XlsxSheetOptions extends XlsxSheetFeatures, SheetLayoutOptions {
+    hidden?: boolean;
+    doAutofilter?: boolean;
+    sampleRows?: unknown[][];
+    autofit?: boolean;
+    autofitRows?: number;
+    columnWidths?: Array<number | null | undefined>;
+}
+
+interface XlsxSheetFeatures {
     merges?: string[];
     hyperlinks?: Array<{ ref: string; target?: string; location?: string; tooltip?: string; display?: string }>;
     dataValidations?: DataValidationSpec[];
     conditionalFormats?: ConditionalFormatSpec[];
     comments?: Array<{ ref: string; text: string; author?: string }>;
-    columnWidths?: Array<number | null | undefined>;
-    autofit?: boolean;
-    autofitRows?: number;
-    sampleRows?: unknown[][];
+}
+
+interface SheetLayoutOptions {
+    headerStyle?: CellStyle;
+    styles?: Record<string, CellStyle>; // A1 range, B:D, B2:D, or 1:3
+    rowHeights?: Record<number, number>; // 0-based, points
+    hiddenRows?: number[];
+    hiddenColumns?: number[];
+    rowGroups?: GroupSpec[];
+    columnGroups?: GroupSpec[];
+    freezePanes?: string | false | null; // default: freeze header row when present
+    showGridLines?: boolean;
+    showRowColHeaders?: boolean;
+    showZeroValues?: boolean;
+    rightToLeft?: boolean;
+    zoom?: number; // 10..400
+    tabColor?: StyleColor;
+    sheetProtection?: SheetProtectionSpec;
+    autoFilterRef?: string;
+    tables?: TableSpec[];
 }
 ```
 
-XLSB accepts the same options except `conditionalFormats` and `comments`, which
-throw a clear error because the XLSB writer does not emit those parts yet.
-XLSB rich text is also XLSX-only.
+`XlsbSheetOptions` and the browser writers accept the same option object. XLSB
+supports rich text, comments, Excel tables, conditional formats, sheet
+protection and the complete layout API. The style features XLSB cannot encode
+are the `start`/`end`/`vertical`/`horizontal` border sides, `relativeIndent` and
+the `quotePrefix`/`pivotButton` cell flags; those throw with a message pointing
+at `XlsxWriter`.
+
+### Tables and protection
+
+```typescript
+interface TableSpec {
+    name: string; // unique, e.g. 'SalesTable'
+    ref: string; // includes the header and optional totals row
+    columns: Array<string | {
+        name: string;
+        totalsRowFunction?: 'average' | 'count' | 'countNums' | 'max' | 'min'
+            | 'sum' | 'stdDev' | 'var' | 'custom';
+        totalsRowLabel?: string;
+        totalsRowFormula?: string;
+    }>;
+    headerRow?: boolean;
+    totalsRow?: boolean;
+    styleName?: string; // default TableStyleMedium9
+    showFirstColumn?: boolean;
+    showLastColumn?: boolean;
+    showRowStripes?: boolean;
+    showColumnStripes?: boolean;
+}
+
+interface SheetProtectionSpec {
+    enabled?: boolean; // default true
+    password?: string; // legacy Excel hash
+    selectLockedCells?: boolean; // true = selection allowed (default)
+    selectUnlockedCells?: boolean; // true = selection allowed (default)
+    // true = block the action, false = explicitly allow it, omitted = Excel's
+    // default (blocked)
+    formatCells?: boolean;
+    formatColumns?: boolean;
+    formatRows?: boolean;
+    insertColumns?: boolean;
+    insertRows?: boolean;
+    insertHyperlinks?: boolean;
+    deleteColumns?: boolean;
+    deleteRows?: boolean;
+    sort?: boolean;
+    autoFilter?: boolean;
+    pivotTables?: boolean;
+    objects?: boolean; // true = protect objects (default)
+    scenarios?: boolean; // true = protect scenarios (default)
+}
+```
+
+### Conditional formats and validations
+
+`conditionalFormats` accepts `cellIs`, `expression`, `top10`, `duplicateValues`,
+`uniqueValues`, `containsText`, `notContainsText`, `beginsWith`, `endsWith`,
+`colorScale`, `dataBar` and `iconSet` rules. `dataValidations` accepts `whole`,
+`decimal`, `list`, `date`, `time`, `textLength` and `custom` rules, including
+prompt and error messages.
 
 ### Column autofit
 

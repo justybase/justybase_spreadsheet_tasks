@@ -7,10 +7,13 @@ import { BigBuffer } from './BigBuffer';
 import {
     CellValue,
     ExcelError,
+    CellStyle,
     FormulaCell,
+    StyleColor,
     getCellStyle,
     getFormula,
     isRichText,
+    mergeCellStyles,
     unwrapCell,
 } from './Formats';
 import { StreamingSheetState } from './StreamingSheetState';
@@ -41,10 +44,19 @@ import {
     writeXlsbRkInteger,
     writeXlsbRowHeader,
     writeXlsbSharedStrings,
+    XlsbSharedString,
     XLSB_STYLES_TEMPLATE,
 } from './writers/core/xlsbRecords';
 import { XlsbStyleRegistry } from './writers/core/xlsbStyles';
 import { buildXlsbFormulaRecord } from './writers/core/xlsbFormula';
+import {
+    applyXlsbSheetProtection,
+    buildXlsbColumnRecords,
+    buildXlsbLegacyDrawingRecord,
+    buildXlsbPaneRecord,
+    buildXlsbSelectionRecord,
+    xlsbColorPayload,
+} from './writers/core/xlsbLayout';
 import {
     buildXlsbHyperlinkRecord,
     buildXlsbMergeRecords,
@@ -52,11 +64,85 @@ import {
     parseXlsbRange,
 } from './writers/core/xlsbSheetFeatures';
 import {
+    CommentSpec,
+    ConditionalFormatSpec,
     DataValidationSpec,
     HyperlinkSpec,
+    SheetLayoutOptions,
     XlsxSheetFeatures,
 } from './writers/core/xlsxParts';
+import {
+    FreezePane,
+    NormalizedTableSpec,
+    Outline,
+    SheetProtectionSpec,
+    StyleRangeSet,
+    buildOutline,
+    normalizeGroups,
+    normalizeTableSpec,
+    parseRangeRef,
+    resolveFreezePanes,
+    validateRowHeight,
+    validateZoom,
+    tableTotalsOverrides,
+    TableTotalsOverride,
+} from './writers/core/sheetLayout';
+import {
+    XlsbDxfRegistry,
+    buildXlsbConditionalFormatRecords,
+} from './writers/core/xlsbConditionalFormat';
+import { buildXlsbCommentsPart, buildXlsbCommentsVml } from './writers/core/xlsbComments';
+import { buildXlsbListParts, buildXlsbTablePart } from './writers/core/xlsbTable';
 import { escapeXmlText } from './xmlUtils';
+import { XLSX_THEME_XML } from './writers/core/theme';
+
+/** Apply table totals overrides to one row, preserving the caller's style/cache. */
+function withTableTotals(row: CellValue[], overrides: TableTotalsOverride[]): CellValue[] {
+    let result: CellValue[] | null = null;
+    for (const override of overrides) {
+        if (override.col < 0) continue;
+        const original = row[override.col];
+        const record = original !== null && typeof original === 'object' && !(original instanceof Date)
+            ? original as unknown as Record<string, unknown>
+            : null;
+        const style = record && record.style ? record.style as CellStyle : undefined;
+        const cachedValue = record?.value;
+        const cached = typeof cachedValue === 'string' || typeof cachedValue === 'number'
+            || typeof cachedValue === 'boolean' || cachedValue instanceof Date
+            ? cachedValue
+            : (typeof original === 'number' ? original : undefined);
+        const replacement: CellValue = override.text !== undefined
+            ? (style ? { value: override.text, style } : override.text)
+            : {
+                formula: override.formula as string,
+                ...(cached !== undefined ? { value: cached } : {}),
+                ...(style ? { style } : {}),
+            } as CellValue;
+        if (!result) result = row.slice();
+        result[override.col] = replacement;
+    }
+    return result ?? row;
+}
+
+interface ResolvedXlsbLayout {
+    headerStyle: CellStyle | null;
+    styleRanges: StyleRangeSet;
+    rowHeights: Record<number, number>;
+    hiddenRows: Set<number>;
+    hiddenColumns: number[];
+    rowOutline: Outline;
+    columnOutline: Outline;
+    freezePanes: FreezePane | null;
+    showGridLines: boolean;
+    showRowColHeaders: boolean;
+    showZeroValues: boolean;
+    rightToLeft: boolean;
+    zoom?: number;
+    tabColor?: StyleColor;
+    sheetProtection?: SheetProtectionSpec;
+    autoFilterRef?: string;
+    tables: NormalizedTableSpec[];
+}
 
 interface SheetInfo {
     name: string;
@@ -73,11 +159,19 @@ interface SheetInfo {
     };
     merges?: string[];
     dataValidations?: DataValidationSpec[];
+    conditionalFormats?: ConditionalFormatSpec[];
+    cfRecords?: Uint8Array;
+    comments?: CommentSpec[];
+    commentRId?: string;
+    commentVmlRId?: string;
     hyperlinks?: Array<{ spec: HyperlinkSpec; rId?: string; row: number; col: number }>;
+    layout?: ResolvedXlsbLayout;
+    tableParts?: Array<{ id: number; path: string; data: Uint8Array; rId: string }>;
+    extraParts?: Array<{ name: string; data: Uint8Array }>;
 }
 
 /** Options accepted by the XLSB streaming and batch sheet APIs. */
-export interface XlsbSheetOptions extends XlsxSheetFeatures {
+export interface XlsbSheetOptions extends XlsxSheetFeatures, SheetLayoutOptions {
     hidden?: boolean;
     doAutofilter?: boolean;
     sampleRows?: unknown[][];
@@ -104,9 +198,15 @@ export class XlsbWriter {
     private sheetCount: number = 0;
     private sheetList: SheetInfo[] = [];
     private sstDic: Map<string, number> = new Map();
+    private sstRichDic: Map<string, number> = new Map();
+    private sstValues: XlsbSharedString[] = [];
     private sstCntUnique: number = 0;
     private sstCntAll: number = 0;
     private _autofilterIsOn: boolean = false;
+    private _nextTableId: number = 1;
+    private readonly _dxfs = new XlsbDxfRegistry(
+        format => this._styles.registerNumberFormat(format),
+    );
 
     private _oaEpoch: number;
     private readonly _useSharedStrings: boolean;
@@ -136,6 +236,7 @@ export class XlsbWriter {
     private _streamHasHeaders: boolean = false;
     private _streamDataRows: number = 0;
     private _streamAutofitRows: number = AUTOFIT_SAMPLE_ROWS;
+    private _streamTableTotals: Map<number, TableTotalsOverride[]> = new Map();
 
 
     /**
@@ -288,6 +389,7 @@ export class XlsbWriter {
         rows: unknown[][] | undefined,
         options: XlsbSheetOptions,
         doAutofilter: boolean,
+        headerStyle?: CellStyle,
     ): number[] {
         const widths = initColWidths(columnCount);
         if (options.columnWidths) {
@@ -300,7 +402,7 @@ export class XlsbWriter {
         if (options.autofit === false) return widths;
         if (headers) {
             applyHeaderWidths(widths, headers, columnCount, {
-                bold: true,
+                bold: headerStyle ? headerStyle.font?.bold === true : true,
                 filterButton: doAutofilter,
             });
         }
@@ -312,18 +414,103 @@ export class XlsbWriter {
         return widths;
     }
 
-    /** Store supported sheet features; reject the ones XLSB does not emit yet. */
+    private _resolveLayout(
+        options: XlsbSheetOptions,
+        hasHeaders: boolean,
+        columnCount: number,
+        headers: string[] | null | undefined,
+        rowCount: number = 0,
+    ): ResolvedXlsbLayout {
+        const rowHeights: Record<number, number> = {};
+        for (const [key, value] of Object.entries(options.rowHeights ?? {})) {
+            const row = Number(key);
+            if (!Number.isInteger(row) || row < 0) {
+                throw new RangeError(`rowHeights keys must be non-negative row indices, got '${key}'`);
+            }
+            rowHeights[row] = validateRowHeight(value);
+        }
+        const hiddenRows = new Set<number>();
+        for (const row of options.hiddenRows ?? []) {
+            if (!Number.isInteger(row) || row < 0) {
+                throw new RangeError(`hiddenRows must contain non-negative row indices, got ${row}`);
+            }
+            hiddenRows.add(row);
+        }
+        const hiddenColumns: number[] = [];
+        for (const col of options.hiddenColumns ?? []) {
+            if (!Number.isInteger(col) || col < 0 || col >= columnCount) {
+                throw new RangeError(`hiddenColumns index ${col} is outside the sheet`);
+            }
+            hiddenColumns.push(col);
+        }
+        const rowGroups = normalizeGroups(options.rowGroups, 'row');
+        const columnGroups = normalizeGroups(options.columnGroups, 'column');
+        const rowMax = Math.max(
+            rowCount - 1,
+            ...rowGroups.map(group => group.end),
+            ...Object.keys(rowHeights).map(Number),
+            ...hiddenRows,
+            0,
+        );
+        const columnMax = Math.max(
+            columnCount - 1,
+            ...columnGroups.map(group => group.end),
+            ...hiddenColumns,
+            0,
+        );
+        const tables: NormalizedTableSpec[] = [];
+        for (const spec of options.tables ?? []) {
+            let columns = spec.columns;
+            if ((!columns || columns.length === 0) && headers) {
+                const range = parseRangeRef(spec.ref);
+                columns = headers.slice(range.c1, range.c2 + 1);
+            }
+            tables.push(normalizeTableSpec({ ...spec, columns }, this._nextTableId++));
+        }
+        if (options.autoFilterRef !== undefined) parseRangeRef(options.autoFilterRef);
+        return {
+            headerStyle: options.headerStyle ?? null,
+            styleRanges: new StyleRangeSet(options.styles),
+            rowHeights,
+            hiddenRows,
+            hiddenColumns,
+            rowOutline: buildOutline(rowGroups, rowMax),
+            columnOutline: buildOutline(columnGroups, columnMax),
+            freezePanes: resolveFreezePanes(options.freezePanes, hasHeaders),
+            showGridLines: options.showGridLines !== false,
+            showRowColHeaders: options.showRowColHeaders !== false,
+            showZeroValues: options.showZeroValues !== false,
+            rightToLeft: options.rightToLeft === true,
+            zoom: validateZoom(options.zoom),
+            tabColor: options.tabColor,
+            sheetProtection: options.sheetProtection,
+            autoFilterRef: options.autoFilterRef,
+            tables,
+        };
+    }
+
+    private _headerStyleIndex(layout: ResolvedXlsbLayout): number {
+        if (!layout.headerStyle) return 3;
+        return this._styles.register(mergeCellStyles({ font: { bold: true } }, layout.headerStyle));
+    }
+
+    /** Store sheet features and build the worksheet extra parts. */
     private _applySheetFeatures(sheet: SheetInfo, features: XlsbSheetOptions): void {
-        if (features.conditionalFormats && features.conditionalFormats.length > 0) {
-            throw new Error('Conditional formatting is not supported by XlsbWriter yet; use XlsxWriter.');
-        }
-        if (features.comments && features.comments.length > 0) {
-            throw new Error('Cell comments are not supported by XlsbWriter yet; use XlsxWriter.');
-        }
         if (features.merges) sheet.merges = features.merges;
         if (features.dataValidations) sheet.dataValidations = features.dataValidations;
+
+        if (features.conditionalFormats && features.conditionalFormats.length > 0) {
+            sheet.conditionalFormats = features.conditionalFormats;
+            // Priorities are scoped to one sheet, so every sheet starts at 1.
+            sheet.cfRecords = buildXlsbConditionalFormatRecords(
+                features.conditionalFormats,
+                this._dxfs,
+                1,
+            );
+        }
+
+        let nextRelId = 2; // rId1 is the worksheet binary index
         if (features.hyperlinks && features.hyperlinks.length > 0) {
-            let nextRelId = 2; // rId1 is the worksheet binary index
             sheet.hyperlinks = features.hyperlinks.map(spec => {
                 const range = parseXlsbRange(spec.ref);
                 const internal = spec.target === undefined;
@@ -331,9 +518,38 @@ export class XlsbWriter {
                 return { spec, rId, row: range.r1, col: range.c1 };
             });
         }
+
+        const layout = sheet.layout;
+        if (layout && layout.tables.length > 0) {
+            sheet.tableParts = [];
+            for (let index = 0; index < layout.tables.length; index++) {
+                const table = layout.tables[index];
+                const id = this._nextTableId - layout.tables.length + index;
+                const path = `xl/tables/table${id}.bin`;
+                const data = buildXlsbTablePart(table, id);
+                sheet.tableParts.push({ id, path, data, rId: `rId${nextRelId++}` });
+                sheet.extraParts = [...(sheet.extraParts ?? []), { name: path, data }];
+            }
+        }
+
+        if (features.comments && features.comments.length > 0) {
+            sheet.comments = features.comments;
+            sheet.commentRId = `rId${nextRelId++}`;
+            sheet.commentVmlRId = `rId${nextRelId++}`;
+            const commentPath = `xl/comments/comment${sheet.sheetId}.bin`;
+            const vmlPath = `xl/drawings/commentsDrawing${sheet.sheetId}.vml`;
+            sheet.extraParts = [
+                ...(sheet.extraParts ?? []),
+                { name: commentPath, data: buildXlsbCommentsPart(features.comments, commentPath) },
+                {
+                    name: vmlPath,
+                    data: new TextEncoder().encode(buildXlsbCommentsVml(features.comments)),
+                },
+            ];
+        }
     }
 
-    /** Merged cells, validations and hyperlinks go after the autoFilter. */
+    /** Merged cells, validations, hyperlinks and conditional formats. */
     private _writeFeatureRecords(bigBuf: BigBuffer, sheet: SheetInfo): void {
         if (sheet.merges && sheet.merges.length > 0) {
             bigBuf.write(buildXlsbMergeRecords(sheet.merges));
@@ -344,13 +560,32 @@ export class XlsbWriter {
         for (const link of sheet.hyperlinks ?? []) {
             bigBuf.write(buildXlsbHyperlinkRecord(link.row, link.col, link.spec, link.rId));
         }
+        if (sheet.cfRecords && sheet.cfRecords.length > 0) {
+            bigBuf.write(sheet.cfRecords);
+        }
+    }
+
+    /** Write the template's tail plus table/list/comment records. */
+    private _writeSheetFooterRecords(
+        bigBuf: BigBuffer,
+        sheet: SheetInfo,
+        sheetHeader: Buffer,
+    ): void {
+        bigBuf.write(sheetHeader.subarray(290, 346));
+        const relIds = (sheet.tableParts ?? []).map(part => part.rId);
+        if (relIds.length > 0) bigBuf.write(buildXlsbListParts(relIds));
+        if (sheet.commentVmlRId !== undefined) {
+            bigBuf.write(buildXlsbLegacyDrawingRecord(sheet.commentVmlRId));
+        }
+        bigBuf.write(sheetHeader.subarray(346));
     }
 
     /** Write one cell using the current style registry and formula compiler. */
-    private _writeCell(bigBuf: BigBuffer, raw: CellValue, col: number): void {
+    private _writeCell(bigBuf: BigBuffer, raw: CellValue, col: number, extraStyle?: CellStyle | null): void {
         if (raw === null || raw === undefined) return;
 
-        const style = getCellStyle(raw);
+        const cellStyle = getCellStyle(raw);
+        const style = extraStyle ? mergeCellStyles(cellStyle, extraStyle) : cellStyle;
         let styleNum = style !== null ? this._styles.register(style) : 0;
 
         const formula = getFormula(raw);
@@ -359,7 +594,7 @@ export class XlsbWriter {
             let cached: string | number | boolean | ExcelError | null | undefined;
             if (rawCached instanceof Date) {
                 cached = timeToOaDate(rawCached.getTime(), this._oaEpoch);
-                if (styleNum === 0) styleNum = dateHasTime(rawCached) ? 2 : 1;
+                if (styleNum === 0) styleNum = dateHasTime(rawCached) ? 1 : 2;
             } else if (isRichText(rawCached)) {
                 cached = rawCached.toString();
             } else if (typeof rawCached === 'bigint') {
@@ -374,7 +609,8 @@ export class XlsbWriter {
         const val = unwrapCell(raw);
         if (val === null || val === undefined) return;
         if (isRichText(val)) {
-            throw new Error('Rich text is not supported by XlsbWriter yet; use XlsxWriter.');
+            this._writeRichText(bigBuf, val, col, styleNum);
+            return;
         }
 
         if (typeof val === 'number') {
@@ -395,7 +631,8 @@ export class XlsbWriter {
             this.writeBool(bigBuf, val, col, styleNum);
         } else if (val instanceof Date) {
             const oaDate = timeToOaDate(val.getTime(), this._oaEpoch);
-            const dateStyle = dateHasTime(val) ? 2 : 1;
+            // Base XF 1 carries the date-time format, XF 2 the date-only one.
+            const dateStyle = dateHasTime(val) ? 1 : 2;
             this.writeDouble(bigBuf, oaDate, col, styleNum !== 0 ? styleNum : dateStyle);
         } else {
             this.writeString(bigBuf, val.toString(), col, false, styleNum);
@@ -443,6 +680,14 @@ export class XlsbWriter {
         // Add sheet metadata
         this.addSheet(sheetName, hidden);
         const sheet = this.sheetList[this.sheetCount - 1];
+        const layout = this._resolveLayout(options, headers !== undefined, columnCount, headers);
+        sheet.layout = layout;
+        this._streamTableTotals = new Map();
+        for (const override of tableTotalsOverrides(layout.tables)) {
+            const list = this._streamTableTotals.get(override.row) ?? [];
+            list.push(override);
+            this._streamTableTotals.set(override.row, list);
+        }
         this._applySheetFeatures(sheet, options);
 
         this.stream.begin(columnCount, doAutofilter && headers !== undefined, new BigBuffer());
@@ -453,6 +698,7 @@ export class XlsbWriter {
             undefined,
             options,
             doAutofilter && headers !== undefined,
+            layout.headerStyle ?? undefined,
         );
 
         // The sheet head carries the widths, so it is delayed until the first
@@ -466,9 +712,18 @@ export class XlsbWriter {
         // Write header row if provided
         if (headers) {
             const pending = this._streamPending;
-            this.createRowHeader(pending, this.stream.rowNum, this.stream.startCol, this.stream.endCol);
+            this.createRowHeader(
+                pending, this.stream.rowNum, this.stream.startCol, this.stream.endCol,
+                this._rowHeaderOptions(layout, 0),
+            );
+            const headerStyle = this._headerStyleIndex(layout);
+            const baseHeader = mergeCellStyles({ font: { bold: true } }, layout.headerStyle);
             for (let c = 0; c < headers.length; c++) {
-                this.writeString(pending, headers[c], c, true);
+                const rangeStyle = layout.styleRanges.styleFor(0, c);
+                const style = rangeStyle
+                    ? this._styles.register(mergeCellStyles(baseHeader, rangeStyle))
+                    : headerStyle;
+                this.writeString(pending, headers[c], c, false, style);
             }
             this.stream.rowNum++;
         }
@@ -481,46 +736,53 @@ export class XlsbWriter {
         const bigBuf = this.stream.assertStreaming();
         const pending = this._streamPending;
 
+        const layout = this.sheetList[this.sheetCount - 1]?.layout;
         const sheetHeader = Buffer.from(this._sheet1Bytes);
+        applyXlsbSheetProtection(sheetHeader, layout?.sheetProtection);
         sheetHeader.writeInt32LE(this.stream.startCol, 40);
         sheetHeader.writeInt32LE(this.stream.endCol - 1, 44);
 
-        if (this.sheetCount !== 1) {
-            sheetHeader[54] = 0x9C;
+        // Tab colour lives in the BrtWsProp payload (bytes 9..16).
+        if (layout?.tabColor !== undefined) {
+            Buffer.from(xlsbColorPayload(layout.tabColor)).copy(sheetHeader, 9);
         }
 
-        bigBuf.write(sheetHeader.subarray(0, 84));
+        // BrtBeginWsView flags: fDspGrid 0x04, fDspRwCol 0x08,
+        // fDspZeros 0x10, fRightToLeft 0x20, fSelected 0x40.
+        let viewFlags = this.sheetCount === 1 ? 0xDC : 0x9C;
+        if (layout?.showGridLines === false) viewFlags &= ~0x04;
+        if (layout?.showRowColHeaders === false) viewFlags &= ~0x08;
+        if (layout?.showZeroValues === false) viewFlags &= ~0x10;
+        if (layout?.rightToLeft) viewFlags |= 0x20;
+        sheetHeader[54] = viewFlags;
 
-        // Write sticky header if headers are present
-        if (this._streamHasHeaders) {
-            bigBuf.write(this._stickHeaderA1bytes);
+        bigBuf.write(sheetHeader.subarray(0, 55));
+
+        let viewTail = Buffer.from(sheetHeader.subarray(55, 84));
+        if (layout?.zoom !== undefined) {
+            const scale = Buffer.alloc(4);
+            scale.writeUInt16LE(layout.zoom, 0);
+            scale.writeUInt16LE(layout.zoom, 2);
+            viewTail = Buffer.concat([viewTail.subarray(0, 17), scale, viewTail.subarray(21)]);
         }
+        bigBuf.write(viewTail);
 
-        bigBuf.write(sheetHeader.subarray(84, 159));
+        bigBuf.write(buildXlsbPaneRecord(layout?.freezePanes ?? null));
+        bigBuf.write(buildXlsbSelectionRecord(layout?.freezePanes ?? null));
+        bigBuf.write(sheetHeader.subarray(123, 157));
+        bigBuf.write(Buffer.from([
+            layout?.rowOutline.maxLevel ?? 0,
+            layout?.columnOutline.maxLevel ?? 0,
+        ]));
 
-        // Write column definitions
-        bigBuf.writeByte(134);
-        bigBuf.writeByte(3);
-        bigBuf.writeByte(0);
-
-        for (let i = this.stream.startCol; i < this.stream.endCol; i++) {
-            bigBuf.writeByte(60);
-            bigBuf.writeByte(18);
-
-            bigBuf.writeInt32LE(i);
-            bigBuf.writeInt32LE(i);
-
-            const width = defaultColWidth(this.stream.colWidths[i]);
-            bigBuf.writeInt32LE(Math.max(0, Math.min(255 * 256, Math.round(width * 256))));
-
-            bigBuf.writeInt32LE(0);
-            bigBuf.writeByte(2);
-            bigBuf.writeByte(0);
-        }
-
-        bigBuf.writeByte(135);
-        bigBuf.writeByte(3);
-        bigBuf.writeByte(0);
+        const widths = this.stream.colWidths.map(width => defaultColWidth(width));
+        bigBuf.write(buildXlsbColumnRecords({
+            startCol: this.stream.startCol,
+            endCol: this.stream.endCol,
+            widths,
+            hiddenColumns: layout?.hiddenColumns ?? [],
+            outline: layout?.columnOutline,
+        }));
 
         bigBuf.write(sheetHeader.subarray(159, 175));
         bigBuf.write(Buffer.from([38, 0]));
@@ -532,11 +794,34 @@ export class XlsbWriter {
         this._streamHeadFlushed = true;
     }
 
+    private _rowHeaderOptions(layout: ResolvedXlsbLayout | undefined, rowIndex: number): import('./writers/core/xlsbRecords').XlsbRowHeaderOptions {
+        if (!layout) return {};
+        const options: import('./writers/core/xlsbRecords').XlsbRowHeaderOptions = {};
+        const height = layout.rowHeights[rowIndex];
+        if (height !== undefined) options.heightTwips = Math.round(height * 20);
+        if (layout.hiddenRows.has(rowIndex)) options.hidden = true;
+        if (rowIndex < layout.rowOutline.level.length) {
+            options.outlineLevel = layout.rowOutline.level[rowIndex];
+            if (layout.rowOutline.hidden[rowIndex]) options.hidden = true;
+            if (layout.rowOutline.collapsed[rowIndex]) options.collapsed = true;
+        }
+        return options;
+    }
+
     private _writeStreamRow(bigBuf: BigBuffer, row: CellValue[]): void {
         assertRowCount(this.stream.rowNum + 1);
-        this.createRowHeader(bigBuf, this.stream.rowNum, this.stream.startCol, this.stream.endCol);
+        const layout = this.sheetList[this.sheetCount - 1]?.layout;
+        const totals = this._streamTableTotals.get(this.stream.rowNum);
+        if (totals) row = withTableTotals(row, totals);
+        this.createRowHeader(
+            bigBuf,
+            this.stream.rowNum,
+            this.stream.startCol,
+            this.stream.endCol,
+            this._rowHeaderOptions(layout, this.stream.rowNum),
+        );
         for (let c = 0; c < row.length; c++) {
-            this._writeCell(bigBuf, row[c], c);
+            this._writeCell(bigBuf, row[c], c, layout?.styleRanges.styleFor(this.stream.rowNum, c));
         }
         this.stream.rowNum++;
     }
@@ -571,7 +856,9 @@ export class XlsbWriter {
     endSheet(): void {
         this._flushStreamHead();
         const bigBuf = this.stream.assertStreaming();
+        const sheet = this.sheetList[this.sheetCount - 1];
         const sheetHeader = Buffer.from(this._sheet1Bytes);
+        applyXlsbSheetProtection(sheetHeader, sheet.layout?.sheetProtection);
 
         // Write sheet footer sections
         bigBuf.write(sheetHeader.subarray(218, 290));
@@ -596,7 +883,6 @@ export class XlsbWriter {
             bigBuf.write(this._autoFilterEndBytes);
 
             // Store filter data for later
-            const sheet = this.sheetList[this.sheetCount - 1];
             sheet.filterData = {
                 startRow: 0,
                 endRow: endRow - 1,
@@ -605,9 +891,8 @@ export class XlsbWriter {
             };
         }
 
-        this._writeFeatureRecords(bigBuf, this.sheetList[this.sheetCount - 1]);
-
-        bigBuf.write(sheetHeader.subarray(290));
+        this._writeFeatureRecords(bigBuf, sheet);
+        this._writeSheetFooterRecords(bigBuf, sheet, sheetHeader);
 
         // BrtWsDim was written with row 0; patch the inclusive last row now
         // that the row count is known (fixed offset 36 in the sheet header).
@@ -615,7 +900,7 @@ export class XlsbWriter {
 
         // Add to archive
         this.archive.append(Readable.from(bigBuf.getChunks()), {
-            name: this.sheetList[this.sheetCount - 1].pathInArchive
+            name: sheet.pathInArchive
         });
 
         // Reset streaming state
@@ -625,6 +910,7 @@ export class XlsbWriter {
         this._streamHasHeaders = false;
         this._streamDataRows = 0;
         this._streamAutofitRows = AUTOFIT_SAMPLE_ROWS;
+        this._streamTableTotals = new Map();
     }
 
 
@@ -677,7 +963,36 @@ export class XlsbWriter {
         if (!sheet) {
             throw new Error('Call addSheet() before writeSheet()');
         }
+        const layout = this._resolveLayout(
+            options,
+            headers !== null && headers !== undefined,
+            columnCount,
+            headers,
+            totalRowsCheck,
+        );
+        sheet.layout = layout;
         this._applySheetFeatures(sheet, options);
+
+        const totalsOverrides = tableTotalsOverrides(layout.tables);
+        if (totalsOverrides.length > 0) {
+            const headerOffset = headers ? 1 : 0;
+            const byRow = new Map<number, TableTotalsOverride[]>();
+            for (const override of totalsOverrides) {
+                const index = override.row - headerOffset;
+                if (index < 0 || index >= rows.length) {
+                    throw new Error(
+                        `Table totals row ${override.row + 1} is outside the written rows `
+                        + `(the sheet has ${totalRowsCheck} rows)`,
+                    );
+                }
+                const list = byRow.get(index) ?? [];
+                list.push(override);
+                byRow.set(index, list);
+            }
+            for (const [index, list] of byRow) {
+                rows[index] = withTableTotals(rows[index], list);
+            }
+        }
 
         const colWidths = this._resolveColumnWidths(
             columnCount,
@@ -685,49 +1000,53 @@ export class XlsbWriter {
             rows,
             options,
             doAutofilter && headers !== null && headers !== undefined,
+            layout.headerStyle ?? undefined,
         );
 
         const sheetHeader = Buffer.from(this._sheet1Bytes);
+        applyXlsbSheetProtection(sheetHeader, layout.sheetProtection);
         const startCol = 0;
         const endCol = columnCount;
 
         sheetHeader.writeInt32LE(startCol, 40);
         sheetHeader.writeInt32LE(endCol - 1, 44);
 
-        if (this.sheetCount !== 1) {
-            sheetHeader[54] = 0x9C;
+        if (layout.tabColor !== undefined) {
+            Buffer.from(xlsbColorPayload(layout.tabColor)).copy(sheetHeader, 9);
         }
 
-        bigBuf.write(sheetHeader.subarray(0, 84));
+        let viewFlags = this.sheetCount === 1 ? 0xDC : 0x9C;
+        if (!layout.showGridLines) viewFlags &= ~0x04;
+        if (!layout.showRowColHeaders) viewFlags &= ~0x08;
+        if (!layout.showZeroValues) viewFlags &= ~0x10;
+        if (layout.rightToLeft) viewFlags |= 0x20;
+        sheetHeader[54] = viewFlags;
 
-        if (headers) {
-            bigBuf.write(this._stickHeaderA1bytes);
+        bigBuf.write(sheetHeader.subarray(0, 55));
+        let viewTail = Buffer.from(sheetHeader.subarray(55, 84));
+        if (layout.zoom !== undefined) {
+            const scale = Buffer.alloc(4);
+            scale.writeUInt16LE(layout.zoom, 0);
+            scale.writeUInt16LE(layout.zoom, 2);
+            viewTail = Buffer.concat([viewTail.subarray(0, 17), scale, viewTail.subarray(21)]);
         }
+        bigBuf.write(viewTail);
+        bigBuf.write(buildXlsbPaneRecord(layout.freezePanes));
+        bigBuf.write(buildXlsbSelectionRecord(layout.freezePanes));
+        bigBuf.write(sheetHeader.subarray(123, 157));
+        bigBuf.write(Buffer.from([
+            layout.rowOutline.maxLevel,
+            layout.columnOutline.maxLevel,
+        ]));
 
-        bigBuf.write(sheetHeader.subarray(84, 159));
-
-        bigBuf.writeByte(134);
-        bigBuf.writeByte(3);
-        bigBuf.writeByte(0);
-
-        for (let i = startCol; i < endCol; i++) {
-            bigBuf.writeByte(60);
-            bigBuf.writeByte(18);
-
-            bigBuf.writeInt32LE(i);
-            bigBuf.writeInt32LE(i);
-
-            const width = defaultColWidth(colWidths[i]);
-            bigBuf.writeInt32LE(Math.max(0, Math.min(255 * 256, Math.round(width * 256))));
-
-            bigBuf.writeInt32LE(0);
-            bigBuf.writeByte(2);
-            bigBuf.writeByte(0);
-        }
-
-        bigBuf.writeByte(135);
-        bigBuf.writeByte(3);
-        bigBuf.writeByte(0);
+        const widths = colWidths.map(width => defaultColWidth(width));
+        bigBuf.write(buildXlsbColumnRecords({
+            startCol,
+            endCol,
+            widths,
+            hiddenColumns: layout.hiddenColumns,
+            outline: layout.columnOutline,
+        }));
 
         bigBuf.write(sheetHeader.subarray(159, 175));
         bigBuf.write(Buffer.from([38, 0]));
@@ -735,18 +1054,28 @@ export class XlsbWriter {
         let rowNum = 0;
 
         if (headers) {
-            this.createRowHeader(bigBuf, rowNum, startCol, endCol);
+            this.createRowHeader(
+                bigBuf, rowNum, startCol, endCol, this._rowHeaderOptions(layout, 0),
+            );
+            const headerStyle = this._headerStyleIndex(layout);
+            const baseHeader = mergeCellStyles({ font: { bold: true } }, layout.headerStyle);
             for (let c = 0; c < headers.length; c++) {
-                this.writeString(bigBuf, headers[c], c, true);
+                const rangeStyle = layout.styleRanges.styleFor(0, c);
+                const style = rangeStyle
+                    ? this._styles.register(mergeCellStyles(baseHeader, rangeStyle))
+                    : headerStyle;
+                this.writeString(bigBuf, headers[c], c, false, style);
             }
             rowNum++;
         }
 
         for (let r = 0; r < rows.length; r++) {
-            this.createRowHeader(bigBuf, rowNum, startCol, endCol);
+            this.createRowHeader(
+                bigBuf, rowNum, startCol, endCol, this._rowHeaderOptions(layout, rowNum),
+            );
             const row = rows[r];
             for (let c = 0; c < row.length; c++) {
-                this._writeCell(bigBuf, row[c], c);
+                this._writeCell(bigBuf, row[c], c, layout.styleRanges.styleFor(rowNum, c));
             }
             rowNum++;
         }
@@ -771,7 +1100,6 @@ export class XlsbWriter {
 
             bigBuf.write(this._autoFilterEndBytes);
 
-            const sheet = this.sheetList[this.sheetCount - 1];
             sheet.filterData = {
                 startRow: 0,
                 endRow: rows.length,
@@ -781,18 +1109,23 @@ export class XlsbWriter {
         }
 
         this._writeFeatureRecords(bigBuf, sheet);
-
-        bigBuf.write(sheetHeader.subarray(290));
+        this._writeSheetFooterRecords(bigBuf, sheet, sheetHeader);
 
         bigBuf.patchInt32LE(36, Math.max(0, rowNum - 1));
 
-        this.archive.append(Readable.from(bigBuf.getChunks()), { name: this.sheetList[this.sheetCount - 1].pathInArchive });
+        this.archive.append(Readable.from(bigBuf.getChunks()), { name: sheet.pathInArchive });
     }
 
 
 
-    createRowHeader(bigBuf: BigBuffer, rowNumber: number, startCol: number, endCol: number): void {
-        writeXlsbRowHeader(bigBuf, rowNumber, startCol, endCol);
+    createRowHeader(
+        bigBuf: BigBuffer,
+        rowNumber: number,
+        startCol: number,
+        endCol: number,
+        options: import('./writers/core/xlsbRecords').XlsbRowHeaderOptions = {},
+    ): void {
+        writeXlsbRowHeader(bigBuf, rowNumber, startCol, endCol, options);
     }
 
     writeRkNumberInteger(bigBuf: BigBuffer, val: number, colNum: number, styleNum: number = 0): void {
@@ -816,7 +1149,38 @@ export class XlsbWriter {
         // Use UTC time to avoid timezone conversion issues; handles the
         // fictitious 1900-02-29.
         const oaDate = timeToOaDate(date.getTime(), this._oaEpoch);
-        this.writeDouble(bigBuf, oaDate, colNum, dateHasTime(date) ? 2 : 1);
+        this.writeDouble(bigBuf, oaDate, colNum, dateHasTime(date) ? 1 : 2);
+    }
+
+    private _writeRichText(
+        bigBuf: BigBuffer,
+        value: import('./Formats').RichText,
+        colNum: number,
+        styleNum: number,
+    ): void {
+        if (!this._useSharedStrings) {
+            // BrtCellSt can only hold plain text; keep the text, drop the runs.
+            this.writeString(bigBuf, value.toString(), colNum, false, styleNum);
+            return;
+        }
+        const runs: Array<{ ich: number; ifnt: number }> = [];
+        let offset = 0;
+        for (const run of value.runs) {
+            runs.push({ ich: offset, ifnt: this._styles.registerRichFont(run.style?.font) });
+            offset += run.text.length;
+        }
+        const text = value.toString();
+        assertCellTextLength(text);
+        const key = JSON.stringify({ text, runs });
+        let index = this.sstRichDic.get(key);
+        if (index === undefined) {
+            index = this.sstValues.length;
+            this.sstRichDic.set(key, index);
+            this.sstValues.push({ text, runs });
+            this.sstCntUnique++;
+        }
+        this.sstCntAll++;
+        writeXlsbIsst(bigBuf, index, colNum, styleNum);
     }
 
     writeString(bigBuf: BigBuffer, val: string, colNum: number, bolded: boolean = false, styleOverride?: number): void {
@@ -828,12 +1192,11 @@ export class XlsbWriter {
             return;
         }
 
-        let index: number;
-        if (this.sstDic.has(val)) {
-            index = this.sstDic.get(val)!;
-        } else {
-            index = this.sstCntUnique;
+        let index = this.sstDic.get(val);
+        if (index === undefined) {
+            index = this.sstValues.length;
             this.sstDic.set(val, index);
+            this.sstValues.push(val);
             this.sstCntUnique++;
         }
         this.sstCntAll++;
@@ -843,7 +1206,7 @@ export class XlsbWriter {
 
     private saveSst(): void {
         const bigBuf = new BigBuffer();
-        writeXlsbSharedStrings(bigBuf, this.sstDic.keys(), this.sstCntAll, this.sstCntUnique);
+        writeXlsbSharedStrings(bigBuf, this.sstValues, this.sstCntAll, this.sstCntUnique);
         this.archive.append(Readable.from(bigBuf.getChunks()), { name: 'xl/sharedStrings.bin' });
     }
 
@@ -930,7 +1293,15 @@ export class XlsbWriter {
                 if (this._outputError) throw this._outputError;
                 this.saveSst();
 
-                this.archive.append(Buffer.from(this._buildStylesBin()), { name: 'xl/styles.bin' });
+                this.archive.append(
+                    Buffer.from(this._styles.toStylesBin(this._stylesBin, this._dxfs.toRecords())),
+                    { name: 'xl/styles.bin' },
+                );
+                for (const sheet of this.sheetList) {
+                    for (const part of sheet.extraParts ?? []) {
+                        this.archive.append(Buffer.from(part.data), { name: part.name });
+                    }
+                }
 
                 const wbBuffers: Buffer[] = [];
                 wbBuffers.push(this._workbookBinStart);
@@ -1003,19 +1374,31 @@ export class XlsbWriter {
                     this.archive.append(this._binaryIndexBin, { name: `xl/worksheets/binaryIndex${sheet.sheetId}.bin` });
                 }
 
+                const hasComments = this.sheetList.some(sheet => (sheet.comments?.length ?? 0) > 0);
                 let contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="bin" ContentType="application/vnd.ms-excel.sheet.binary.macroEnabled.main"/>
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 <Default Extension="xml" ContentType="application/xml"/>`;
+                if (hasComments) {
+                    contentTypes += '<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>';
+                }
                 for (const sheet of this.sheetList) {
                     contentTypes += `<Override PartName="/${sheet.pathInArchive}" ContentType="application/vnd.ms-excel.worksheet"/>`;
                     contentTypes += `<Override PartName="/xl/worksheets/binaryIndex${sheet.sheetId}.bin" ContentType="application/vnd.ms-excel.binIndexWs"/>`;
+                    for (const part of sheet.tableParts ?? []) {
+                        contentTypes += `<Override PartName="/${part.path}" ContentType="application/vnd.ms-excel.table"/>`;
+                    }
+                    if ((sheet.comments?.length ?? 0) > 0) {
+                        contentTypes += `<Override PartName="/xl/comments/comment${sheet.sheetId}.bin" ContentType="application/vnd.ms-excel.comments"/>`;
+                    }
                 }
                 contentTypes += `<Override PartName="/xl/styles.bin" ContentType="application/vnd.ms-excel.styles"/>
 <Override PartName="/xl/sharedStrings.bin" ContentType="application/vnd.ms-excel.sharedStrings"/>
+<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
 </Types>`;
                 this.archive.append(contentTypes, { name: '[Content_Types].xml' });
+                this.archive.append(XLSX_THEME_XML, { name: 'xl/theme/theme1.xml' });
 
                 let wbRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">`;
@@ -1025,6 +1408,7 @@ export class XlsbWriter {
                 }
                 wbRels += `<Relationship Id="rId${this.sheetList.length + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.bin"/>
 <Relationship Id="rId${this.sheetList.length + 3}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.bin"/>
+<Relationship Id="rId${this.sheetList.length + 4}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
 </Relationships>`;
                 this.archive.append(wbRels, { name: 'xl/_rels/workbook.bin.rels' });
 
@@ -1041,6 +1425,15 @@ export class XlsbWriter {
                     for (const link of sheet.hyperlinks ?? []) {
                         if (!link.rId || link.spec.target === undefined) continue;
                         wsRels += `<Relationship Id="${link.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXmlText(link.spec.target)}" TargetMode="External"/>`;
+                    }
+                    for (const part of sheet.tableParts ?? []) {
+                        wsRels += `<Relationship Id="${part.rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/${part.path.split('/').pop()}"/>`;
+                    }
+                    if (sheet.commentRId !== undefined) {
+                        wsRels += `<Relationship Id="${sheet.commentRId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments/comment${sheet.sheetId}.bin"/>`;
+                    }
+                    if (sheet.commentVmlRId !== undefined) {
+                        wsRels += `<Relationship Id="${sheet.commentVmlRId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/commentsDrawing${sheet.sheetId}.vml"/>`;
                     }
                     wsRels += '</Relationships>';
                     this.archive.append(wsRels, { name: `xl/worksheets/_rels/${sheet.nameInArchive}.rels` });
